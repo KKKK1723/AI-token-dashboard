@@ -95,28 +95,54 @@ def _text(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
+def _percentage_tenths(token_counts: list[int]) -> list[int]:
+    total_tokens = sum(token_counts)
+    if total_tokens == 0:
+        return [0] * len(token_counts)
+
+    shares = [divmod(tokens * 1_000, total_tokens) for tokens in token_counts]
+    percentage_tenths = [quotient for quotient, _ in shares]
+    missing_tenths = 1_000 - sum(percentage_tenths)
+
+    # Largest-remainder allocation keeps one-decimal labels at exactly 100.0%.
+    remainder_order = sorted(
+        range(len(shares)), key=lambda index: (-shares[index][1], index)
+    )
+    for index in remainder_order[:missing_tenths]:
+        percentage_tenths[index] += 1
+    return percentage_tenths
+
+
 def render_svg(snapshot: UsageSnapshot, theme_name: str) -> str:
     if theme_name not in THEMES:
         raise ValueError(f"Unknown theme: {theme_name}")
     theme = THEMES[theme_name]
     top_models = snapshot.models[:3]
-    colors = (theme.green, theme.blue, theme.orange)
-    row_positions = (177, 205, 233)
-    total_tokens = snapshot.total_tokens
+    top_colors = (theme.green, theme.blue, theme.orange)
+    other_tokens = sum(model.total_tokens for model in snapshot.models[3:])
+    usage_rows = [
+        (model.name, model.total_tokens, top_colors[index], theme.text)
+        for index, model in enumerate(top_models)
+    ]
+    usage_rows.extend([None] * (3 - len(usage_rows)))
+    usage_rows.append(("Others", other_tokens, theme.muted, theme.text))
+    row_positions = (169, 193, 217, 241)
+    percentage_tenths = _percentage_tenths(
+        [row[1] if row is not None else 0 for row in usage_rows]
+    )
 
     model_rows: list[str] = []
     for index, y_position in enumerate(row_positions):
-        if index < len(top_models):
-            model = top_models[index]
-            percentage = (
-                model.total_tokens * 100 / total_tokens if total_tokens else 0
-            )
+        row = usage_rows[index]
+        if row is not None:
+            name, row_tokens, bar_color, text_color = row
+            percentage = percentage_tenths[index] / 10
             bar_width = max(0.0, min(255.0, 255.0 * percentage / 100))
             model_rows.append(
                 f"""
-  <text class="mono model" x="20" y="{y_position}" fill="{theme.text}">{_text(shorten_model(model.name))}</text>
+  <text class="mono model" x="20" y="{y_position}" fill="{text_color}">{_text(shorten_model(name))}</text>
   <rect x="172" y="{y_position - 6}" width="255" height="6" rx="3" fill="{theme.track}"/>
-  <rect x="172" y="{y_position - 6}" width="{bar_width:.1f}" height="6" rx="3" fill="{colors[index]}"/>
+  <rect x="172" y="{y_position - 6}" width="{bar_width:.1f}" height="6" rx="3" fill="{bar_color}"/>
   <text class="ui percentage" x="482" y="{y_position}" fill="{theme.text}" text-anchor="end">{percentage:.1f}%</text>"""
             )
         else:

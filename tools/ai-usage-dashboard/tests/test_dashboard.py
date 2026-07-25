@@ -169,8 +169,10 @@ class SvgRenderingTests(unittest.TestCase):
             cache_creation_tokens=10_000_000,
             cost_usd=Decimal("12.345"),
             models=(
-                ModelUsage("model<&one", 8, 800_000_000, 0, 300_000_000, 0, Decimal("10")),
-                ModelUsage("model-two", 4, 200_000_000, 50_000_000, 200_000_000, 10_000_000, Decimal("2.345")),
+                ModelUsage("model<&one", 6, 800_000_000, 0, 300_000_000, 0, Decimal("10")),
+                ModelUsage("model-two", 2, 150_000_000, 50_000_000, 0, 0, Decimal("1")),
+                ModelUsage("model-three", 2, 50_000_000, 0, 100_000_000, 0, Decimal("0.8")),
+                ModelUsage("model-four", 2, 0, 0, 100_000_000, 10_000_000, Decimal("0.545")),
             ),
         )
 
@@ -181,6 +183,12 @@ class SvgRenderingTests(unittest.TestCase):
         self.assertEqual(root.attrib["height"], "300")
         self.assertIn("model&lt;&amp;one", svg)
         self.assertIn("LAST 30 DAYS", svg)
+        self.assertIn(">Others</text>", svg)
+        self.assertIn(">7.1%</text>", svg)
+        percentages = [70.5, 12.8, 9.6, 7.1]
+        for percentage in percentages:
+            self.assertIn(f">{percentage:.1f}%</text>", svg)
+        self.assertEqual(sum(percentages), 100.0)
 
     def test_writes_both_themes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
