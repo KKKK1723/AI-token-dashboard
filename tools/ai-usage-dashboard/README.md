@@ -1,13 +1,14 @@
 # AI-token监控面板
 
-这是主页右侧 GitHub Native 看板的本地数据管道。它从 CCSwitch 的 SQLite
+这是 GitHub Native 看板的本地数据管道。它从 CCSwitch 的 SQLite
 数据库读取最近 30 个自然日的统计，生成不依赖外部服务的 `500 x 300` 明暗两套 SVG。
 
 ## 数据口径
 
 - 时间范围是今天加前 29 个自然日，例如今天是 7 月 25 日就统计 6 月 26 日至 7 月 25 日。
-- 数据来自 `proxy_request_logs` 的模型、四类 Token、成本和时间戳字段。
-- 总 Token = Input + Output + Cache Read + Cache Creation。
+- 数据来自 `proxy_request_logs` 的应用类型、Token 语义、模型、四类 Token、成本和时间戳字段。
+- 总 Token = Fresh Input + Output + Cache Read + Cache Creation。
+- Fresh Input 按 CCSwitch 3.18.0 的 `input_token_semantics` 规则归一化，避免 Codex、Gemini 和 Grokbuild 的缓存 Token 被重复计算。
 - Top 3 模型按总 Token 排序。
 - 成本使用 CCSwitch 已计算的 `total_cost_usd`，保留自定义价格和倍率。
 - 不读取请求正文、Session ID、Provider ID 或任何 API Key。
@@ -45,7 +46,7 @@ powershell -ExecutionPolicy Bypass -File `
   tools\ai-usage-dashboard\scripts\install-scheduled-task.ps1
 ```
 
-生成后提交并推送到主页仓库：
+生成后提交并推送到看板仓库：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File `

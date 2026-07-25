@@ -1,6 +1,6 @@
 [project]
 name = "ai-token-dashboard"
-version = "1.0.0"
+version = "1.0.1"
 description = "Generate the AI-token monitoring dashboard from CCSwitch statistics"
 requires-python = ">=3.10"
 

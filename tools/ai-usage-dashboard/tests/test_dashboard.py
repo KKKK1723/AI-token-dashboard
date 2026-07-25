@@ -30,6 +30,8 @@ class UsageDataTests(unittest.TestCase):
                 """
                 CREATE TABLE proxy_request_logs (
                     model TEXT,
+                    app_type TEXT NOT NULL,
+                    input_token_semantics INTEGER NOT NULL,
                     input_tokens INTEGER NOT NULL,
                     output_tokens INTEGER NOT NULL,
                     cache_read_tokens INTEGER NOT NULL,
@@ -50,11 +52,21 @@ class UsageDataTests(unittest.TestCase):
         tokens: tuple[int, int, int, int],
         cost: str,
         created_at: datetime,
+        *,
+        app_type: str = "claude",
+        input_token_semantics: int = 0,
     ) -> None:
         with closing(sqlite3.connect(self.database)) as connection:
             connection.execute(
-                "INSERT INTO proxy_request_logs VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (model, *tokens, cost, int(created_at.timestamp())),
+                "INSERT INTO proxy_request_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    model,
+                    app_type,
+                    input_token_semantics,
+                    *tokens,
+                    cost,
+                    int(created_at.timestamp()),
+                ),
             )
             connection.commit()
 
@@ -82,6 +94,64 @@ class UsageDataTests(unittest.TestCase):
         self.assertEqual(snapshot.cost_usd, Decimal("1.55"))
         self.assertEqual([model.name for model in snapshot.models], ["beta", "alpha"])
         self.assertEqual(snapshot.data_through, now - timedelta(minutes=1))
+
+    def test_normalizes_cache_inclusive_input_like_ccswitch(self) -> None:
+        now = datetime(2026, 7, 25, 15, 10, tzinfo=CST)
+        self.insert_usage(
+            "codex-legacy",
+            (1_000, 50, 800, 20),
+            "1",
+            now,
+            app_type="codex",
+            input_token_semantics=0,
+        )
+        self.insert_usage(
+            "codex-total",
+            (1_000, 50, 800, 100),
+            "1",
+            now,
+            app_type="codex",
+            input_token_semantics=1,
+        )
+        self.insert_usage(
+            "codex-fresh",
+            (100, 50, 800, 100),
+            "1",
+            now,
+            app_type="codex",
+            input_token_semantics=2,
+        )
+        self.insert_usage(
+            "claude",
+            (200, 50, 800, 100),
+            "1",
+            now,
+            app_type="claude",
+            input_token_semantics=0,
+        )
+
+        snapshot = load_usage_snapshot(
+            self.database,
+            now=now,
+            days=30,
+            timezone_name="Asia/Shanghai",
+            retries=1,
+        )
+
+        self.assertEqual(snapshot.input_tokens, 600)
+        self.assertEqual(snapshot.output_tokens, 200)
+        self.assertEqual(snapshot.cache_read_tokens, 3_200)
+        self.assertEqual(snapshot.cache_creation_tokens, 320)
+        self.assertEqual(snapshot.total_tokens, 4_320)
+        self.assertEqual(
+            {model.name: model.total_tokens for model in snapshot.models},
+            {
+                "claude": 1_150,
+                "codex-legacy": 1_070,
+                "codex-total": 1_050,
+                "codex-fresh": 1_050,
+            },
+        )
 
 
 class SvgRenderingTests(unittest.TestCase):

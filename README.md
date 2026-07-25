@@ -9,7 +9,7 @@
 
 ## 监控指标
 
-- 总 Token：Input、Output、Cache Read 与 Cache Creation Token 之和
+- 总 Token：按 CCSwitch 语义归一化后的 Fresh Input、Output、Cache Read 与 Cache Creation 之和
 - 总成本：使用 CCSwitch 记录的 `total_cost_usd`
 - 请求数：统计窗口内的请求总量
 - Top 3 模型：按 Token 使用量排序并展示占比
@@ -22,7 +22,7 @@
 C:\Users\20524\.cc-switch\cc-switch.db
 ```
 
-生成器只读取模型、Token、成本和时间戳字段，不读取请求正文、API Key、Session ID 或 Provider ID。
+生成器只读取应用类型、Token 语义、模型、Token、成本和时间戳字段，不读取请求正文、API Key、Session ID 或 Provider ID。
 
 ## 生成看板
 

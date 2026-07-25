@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="500" height="300" viewBox="0 0 500 300" role="img" aria-labelledby="title desc">
   <title id="title">AI usage over the last 30 days</title>
-  <desc id="desc">9,144 requests, 1,712,791,840 tokens, $992.93 total cost.</desc>
+  <desc id="desc">9,192 requests, 987,098,260 tokens, $998.20 total cost.</desc>
   <style>
     .ui { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
     .mono { font-family: "Cascadia Mono", Consolas, monospace; }
@@ -24,15 +24,15 @@
   <line x1="0" y1="44" x2="500" y2="44" stroke="#30363d"/>
 
   <text class="ui label" x="19" y="72" fill="#8b949e">Total tokens</text>
-  <text class="ui value" x="19" y="102" fill="#f0f6fc">1.713B</text>
+  <text class="ui value" x="19" y="102" fill="#f0f6fc">987.1M</text>
   <line x1="167" y1="44" x2="167" y2="120" stroke="#30363d"/>
 
   <text class="ui label" x="185" y="72" fill="#8b949e">Total cost</text>
-  <text class="ui value" x="185" y="102" fill="#f0f6fc">$992.93</text>
+  <text class="ui value" x="185" y="102" fill="#f0f6fc">$998.20</text>
   <line x1="334" y1="44" x2="334" y2="120" stroke="#30363d"/>
 
   <text class="ui label" x="352" y="72" fill="#8b949e">Requests</text>
-  <text class="ui value" x="352" y="102" fill="#f0f6fc">9,144</text>
+  <text class="ui value" x="352" y="102" fill="#f0f6fc">9,192</text>
   <line x1="0" y1="120" x2="500" y2="120" stroke="#30363d"/>
 
   <text class="ui section" x="20" y="145" fill="#f0f6fc">TOP MODELS</text>
@@ -40,20 +40,20 @@
 
   <text class="mono model" x="20" y="177" fill="#f0f6fc">gpt-5.6-sol</text>
   <rect x="172" y="171" width="255" height="6" rx="3" fill="#21262d"/>
-  <rect x="172" y="171" width="185.0" height="6" rx="3" fill="#3fb950"/>
-  <text class="ui percentage" x="482" y="177" fill="#f0f6fc" text-anchor="end">72.5%</text>
+  <rect x="172" y="171" width="166.7" height="6" rx="3" fill="#3fb950"/>
+  <text class="ui percentage" x="482" y="177" fill="#f0f6fc" text-anchor="end">65.4%</text>
   <text class="mono model" x="20" y="205" fill="#f0f6fc">gpt-5.5</text>
   <rect x="172" y="199" width="255" height="6" rx="3" fill="#21262d"/>
   <rect x="172" y="199" width="32.7" height="6" rx="3" fill="#58a6ff"/>
   <text class="ui percentage" x="482" y="205" fill="#f0f6fc" text-anchor="end">12.8%</text>
   <text class="mono model" x="20" y="233" fill="#f0f6fc">claude-opus-4-8</text>
   <rect x="172" y="227" width="255" height="6" rx="3" fill="#21262d"/>
-  <rect x="172" y="227" width="17.8" height="6" rx="3" fill="#d29922"/>
-  <text class="ui percentage" x="482" y="233" fill="#f0f6fc" text-anchor="end">7.0%</text>
+  <rect x="172" y="227" width="30.8" height="6" rx="3" fill="#d29922"/>
+  <text class="ui percentage" x="482" y="233" fill="#f0f6fc" text-anchor="end">12.1%</text>
 
   <rect x="0.5" y="270" width="499" height="29.5" fill="#161b22"/>
   <line x1="0" y1="270" x2="500" y2="270" stroke="#30363d"/>
   <text class="ui footer" x="18" y="289" fill="#8b949e">Jun 26 - Jul 25</text>
-  <text class="ui footer" x="482" y="289" fill="#8b949e" text-anchor="end">Updated Jul 25 / 18:36 CST</text>
+  <text class="ui footer" x="482" y="289" fill="#8b949e" text-anchor="end">Updated Jul 25 / 19:12 CST</text>
   <rect x="0.5" y="0.5" width="499" height="299" rx="6" fill="none" stroke="#30363d"/>
 </svg>

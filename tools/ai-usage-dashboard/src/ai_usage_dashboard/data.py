@@ -10,6 +10,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
+_CACHE_INCLUSIVE_APP_TYPES = frozenset({"codex", "gemini", "grokbuild"})
+_INPUT_TOKEN_SEMANTICS_LEGACY = 0
+_INPUT_TOKEN_SEMANTICS_TOTAL = 1
+_INPUT_TOKEN_SEMANTICS_FRESH = 2
+
+
 class UsageDataError(RuntimeError):
     """Raised when a consistent usage snapshot cannot be produced."""
 
@@ -113,6 +119,31 @@ def _nonnegative_int(value: object, field: str) -> int:
     return result
 
 
+def _fresh_input_tokens(
+    app_type: str,
+    input_token_semantics: int,
+    input_tokens: int,
+    cache_read_tokens: int,
+    cache_creation_tokens: int,
+) -> int:
+    if input_token_semantics == _INPUT_TOKEN_SEMANTICS_FRESH:
+        return input_tokens
+
+    if app_type in _CACHE_INCLUSIVE_APP_TYPES:
+        if (
+            input_token_semantics == _INPUT_TOKEN_SEMANTICS_TOTAL
+            and input_tokens >= cache_read_tokens + cache_creation_tokens
+        ):
+            return input_tokens - cache_read_tokens - cache_creation_tokens
+        if (
+            input_token_semantics == _INPUT_TOKEN_SEMANTICS_LEGACY
+            and input_tokens >= cache_read_tokens
+        ):
+            return input_tokens - cache_read_tokens
+
+    return input_tokens
+
+
 def _decimal_cost(value: object) -> Decimal:
     try:
         result = Decimal(str(value or "0"))
@@ -132,8 +163,9 @@ def _query_rows(
 ) -> list[tuple[object, ...]]:
     uri = database.resolve().as_uri() + "?mode=ro"
     query = """
-        SELECT model, input_tokens, output_tokens, cache_read_tokens,
-               cache_creation_tokens, total_cost_usd, created_at
+        SELECT app_type, input_token_semantics, model, input_tokens,
+               output_tokens, cache_read_tokens, cache_creation_tokens,
+               total_cost_usd, created_at
         FROM proxy_request_logs
         WHERE created_at >= ? AND created_at <= ?
         ORDER BY created_at
@@ -161,7 +193,7 @@ def load_usage_snapshot(
     *,
     now: datetime | None = None,
     days: int = 30,
-    timezone_name: str = "Asia/Tokyo",
+    timezone_name: str = "Asia/Shanghai",
     retries: int = 5,
     retry_delay: float = 2,
 ) -> UsageSnapshot:
@@ -191,13 +223,37 @@ def load_usage_snapshot(
     newest_timestamp: int | None = None
 
     for row in rows:
-        raw_name, raw_input, raw_output, raw_cache_read, raw_cache_creation, raw_cost, raw_created = row
+        (
+            raw_app_type,
+            raw_input_token_semantics,
+            raw_name,
+            raw_input,
+            raw_output,
+            raw_cache_read,
+            raw_cache_creation,
+            raw_cost,
+            raw_created,
+        ) = row
+        app_type = str(raw_app_type or "").strip().lower()
         model_name = str(raw_name or "unknown").strip() or "unknown"
-        input_tokens = _nonnegative_int(raw_input, "input_tokens")
+        raw_input_tokens = _nonnegative_int(raw_input, "input_tokens")
         output_tokens = _nonnegative_int(raw_output, "output_tokens")
         cache_read_tokens = _nonnegative_int(raw_cache_read, "cache_read_tokens")
         cache_creation_tokens = _nonnegative_int(
             raw_cache_creation, "cache_creation_tokens"
+        )
+        try:
+            input_token_semantics = int(raw_input_token_semantics or 0)
+        except (TypeError, ValueError) as exc:
+            raise UsageDataError(
+                "CC Switch returned an invalid input_token_semantics value"
+            ) from exc
+        input_tokens = _fresh_input_tokens(
+            app_type,
+            input_token_semantics,
+            raw_input_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
         )
         cost_usd = _decimal_cost(raw_cost)
         created_at = int(raw_created)
