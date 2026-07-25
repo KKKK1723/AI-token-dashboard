@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$RepositoryRoot = "",
-    [string]$TaskName = "AI-token监控面板",
+    [string]$TaskName = "AI-token Dashboard",
     [string]$At = "03:10",
     [switch]$Publish
 )
@@ -56,7 +56,7 @@ Register-ScheduledTask `
 
 Write-Host "Registered '$TaskName' for daily execution at $At."
 if ($Publish) {
-    Write-Host "Mode: generate and publish to the profile repository."
+    Write-Host "Mode: generate and publish to the dashboard repository."
 } else {
     Write-Host "Mode: generate local SVG files only. Add -Publish to enable git push."
 }

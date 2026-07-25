@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$TaskName = "AI-token监控面板"
+    [string]$TaskName = "AI-token Dashboard"
 )
 
 Set-StrictMode -Version Latest
