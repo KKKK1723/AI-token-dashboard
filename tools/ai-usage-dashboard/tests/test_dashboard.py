@@ -191,7 +191,8 @@ class SvgRenderingTests(unittest.TestCase):
             self.assertIn("#0d1117", dark.read_text(encoding="utf-8"))
 
     def test_number_formatting(self) -> None:
-        self.assertEqual(format_tokens(1_672_905_975), "1.673B")
+        self.assertEqual(format_tokens(988_910_142), "988,910,142")
+        self.assertEqual(format_tokens(1_672_905_975), "1,672,905,975")
         self.assertEqual(format_cost(Decimal("971.527")), "$971.53")
 
 

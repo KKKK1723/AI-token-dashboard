@@ -73,14 +73,6 @@ MONTHS = (
 
 
 def format_tokens(value: int) -> str:
-    if value >= 1_000_000_000:
-        return f"{value / 1_000_000_000:.3f}B"
-    if value >= 100_000_000:
-        return f"{value / 1_000_000:.1f}M"
-    if value >= 1_000_000:
-        return f"{value / 1_000_000:.2f}M"
-    if value >= 1_000:
-        return f"{value / 1_000:.1f}K"
     return f"{value:,}"
 
 
@@ -158,6 +150,7 @@ def render_svg(snapshot: UsageSnapshot, theme_name: str) -> str:
     .badge {{ font-size: 10px; font-weight: 600; }}
     .label {{ font-size: 10px; }}
     .value {{ font-size: 23px; font-weight: 700; }}
+    .token-value {{ font-size: 19px; font-weight: 700; }}
     .section {{ font-size: 10px; font-weight: 700; text-transform: uppercase; }}
     .section-muted {{ font-size: 9px; text-transform: uppercase; }}
     .model {{ font-size: 10px; }}
@@ -174,7 +167,7 @@ def render_svg(snapshot: UsageSnapshot, theme_name: str) -> str:
   <line x1="0" y1="44" x2="500" y2="44" stroke="{theme.separator}"/>
 
   <text class="ui label" x="19" y="72" fill="{theme.muted}">Total tokens</text>
-  <text class="ui value" x="19" y="102" fill="{theme.text}">{format_tokens(snapshot.total_tokens)}</text>
+  <text class="ui token-value" x="19" y="102" fill="{theme.text}">{format_tokens(snapshot.total_tokens)}</text>
   <line x1="167" y1="44" x2="167" y2="120" stroke="{theme.separator}"/>
 
   <text class="ui label" x="185" y="72" fill="{theme.muted}">Total cost</text>
