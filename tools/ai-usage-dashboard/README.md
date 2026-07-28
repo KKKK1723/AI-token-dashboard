@@ -1,73 +1,61 @@
-# AI-token监控面板
+# SVG 生成与数据口径
 
-这是 GitHub Native 看板的本地数据管道。它从 CCSwitch 的 SQLite
-数据库读取最近 30 个自然日的统计，生成不依赖外部服务的 `500 x 300` 明暗两套 SVG。
+这里保留原有 `500 x 300` 明暗两套 SVG 渲染器。布局、状态栏、最近 30 天窗口和 Top 3 排序均未改动；新后端只把输入从本机 CCSwitch SQLite 换成 Worker 返回的规范化 JSON。
 
-## 数据口径
+## 远端快照
 
-- 时间范围是今天加前 29 个自然日，例如今天是 7 月 25 日就统计 6 月 26 日至 7 月 25 日。
-- 数据来自 `proxy_request_logs` 的应用类型、Token 语义、模型、四类 Token、成本和时间戳字段。
-- 总 Token = Fresh Input + Output + Cache Read + Cache Creation。
-- Fresh Input 按 CCSwitch 3.18.0 的 `input_token_semantics` 规则归一化，避免 Codex、Gemini 和 Grokbuild 的缓存 Token 被重复计算。
-- Top 3 模型按总 Token 排序。
-- 成本使用 CCSwitch 已计算的 `total_cost_usd`，保留自定义价格和倍率。
-- 不读取请求正文、Session ID、Provider ID 或任何 API Key。
-
-## 本地生成
-
-要求 Python 3.10 或更高版本。项目只使用 Python 标准库，不需要安装依赖。
-
-```powershell
-python tools\ai-usage-dashboard\generate.py
-```
-
-生成文件：
-
-```text
-assets/ai-usage/ai-usage-light.svg
-assets/ai-usage/ai-usage-dark.svg
-```
-
-可以用固定时间做检查：
+GitHub Actions 调用 `GET /v1/summary?days=30` 后执行：
 
 ```powershell
 python tools\ai-usage-dashboard\generate.py `
-  --now 2026-07-25T15:10:00+08:00
+  --snapshot-json .local\usage-summary.json `
+  --output-dir assets\ai-usage
 ```
 
-## 每日更新
+远端快照会校验日期窗口、总请求、四类 Token、成本及逐模型合计。数据为空或不一致时不会覆盖上一版 SVG。
 
-本地 CCSwitch 数据库不在 GitHub Actions 的运行环境中，因此每日读取必须在本机执行。
+## 一次性 CCSwitch 种子
 
-只生成本地 SVG：
+迁移脚本只读取 `proxy_request_logs` 的应用类型、Token 语义、模型、四类 Token、成本和时间戳，不读取请求正文、API Key、Session ID 或 Provider ID。
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File `
-  tools\ai-usage-dashboard\scripts\install-scheduled-task.ps1
+python tools\ai-usage-dashboard\export_sync_seed.py `
+  --output .local\ccswitch-seed.json `
+  --days 45 `
+  --timezone Asia/Shanghai
 ```
 
-生成后提交并推送到看板仓库：
+自动截止点默认回退 120 秒，让 CCSwitch 的 60 秒后台导入完成。迁移时应先让 CCSwitch 至少同步一轮，再退出 CCSwitch 后执行导出。`cutoffAt` 之前使用种子绝对值，之后由原生日志采集，避免历史重复。
+
+`--now` 用于固定截止点对账；显式指定时不会应用稳定延迟：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File `
-  tools\ai-usage-dashboard\scripts\install-scheduled-task.ps1 -Publish
+python tools\ai-usage-dashboard\export_sync_seed.py `
+  --output .local\seed-fixed.json `
+  --now 2026-07-28T06:47:00Z
 ```
 
-任务默认每天 03:10 执行，错过后会在下次登录时补跑。发布模式要求仓库工作区干净，
-并使用当前 Git 的 SSH Key 或 Credential Manager，不会把凭据写入脚本。
+## CCSwitch 对账口径
 
-移除任务：
+- 时间范围：今天和前 29 个自然日，以 `Asia/Shanghai` 分桶。
+- 总 Token：Fresh Input + Output + Cache Read + Cache Creation。
+- Claude：按 `message.id` 去重，优先有 `stop_reason` 的快照，否则取较大的 Output。
+- Codex：按线程 UUID 和 token-count 事件计算累计差值，Fresh Input 排除 Cached Input。
+- 成本：使用 CCSwitch 3.18.0 的模型别名、价格表及四类 Token 费率；迁移种子保留 CCSwitch 已计算成本。
+- Top 3：跨来源按模型名合并，再按总 Token、请求数和模型名稳定排序。
+
+保留的本地 SQLite 模式可用于迁移前复核：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File `
-  tools\ai-usage-dashboard\scripts\remove-scheduled-task.ps1
+python tools\ai-usage-dashboard\generate.py `
+  --database $env:USERPROFILE\.cc-switch\cc-switch.db `
+  --output-dir .local\ccswitch-check
 ```
 
 ## 验证
 
 ```powershell
-python -m unittest discover -s tools\ai-usage-dashboard\tests -v
+python -m unittest discover -s tools/ai-usage-dashboard/tests -v
 ```
 
-生成器在写入 SVG 前会解析 XML，并使用临时文件原子替换；数据库暂时不可读或统计为空时，
-会保留上一版看板，不发布空数据。
+生成器只使用 Python 标准库，要求 Python 3.10 或更高版本。

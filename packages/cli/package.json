@@ -1,0 +1,24 @@
+{
+  "name": "@kkkk1723/ai-token-dashboard",
+  "version": "2.0.0",
+  "description": "Sync local AI CLI usage to a personal multi-device dashboard",
+  "type": "module",
+  "bin": {
+    "ai-token-dashboard": "./bin/ai-token-dashboard.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "data",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT"
+}

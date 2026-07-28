@@ -1,0 +1,12 @@
+{
+  "name": "ai-token-dashboard-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "node --test packages/cli/tests/*.test.js packages/worker/tests/*.test.js",
+    "test:python": "python -m unittest discover -s tools/ai-usage-dashboard/tests -v"
+  }
+}

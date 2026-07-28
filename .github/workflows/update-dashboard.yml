@@ -1,0 +1,47 @@
+name: Update AI usage dashboard
+
+on:
+  schedule:
+    - cron: "30 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ai-token-dashboard-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch the 30-day summary
+        env:
+          DASHBOARD_API_URL: ${{ secrets.DASHBOARD_API_URL }}
+          DASHBOARD_READ_KEY: ${{ secrets.DASHBOARD_READ_KEY }}
+        run: |
+          mkdir -p .local
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer ${DASHBOARD_READ_KEY}" \
+            "${DASHBOARD_API_URL%/}/v1/summary?days=30" \
+            --output .local/usage-summary.json
+      - name: Generate unchanged dashboard assets
+        run: |
+          python tools/ai-usage-dashboard/generate.py \
+            --snapshot-json .local/usage-summary.json \
+            --output-dir assets/ai-usage
+      - name: Publish changed assets
+        run: |
+          if git diff --quiet -- assets/ai-usage/ai-usage-light.svg assets/ai-usage/ai-usage-dark.svg; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- assets/ai-usage/ai-usage-light.svg assets/ai-usage/ai-usage-dark.svg
+          git commit -m "chore: update AI usage dashboard ($(date -u +%F))"
+          git push

@@ -1,0 +1,11 @@
+name = "ai-token-dashboard"
+main = "src/index.js"
+compatibility_date = "2026-07-28"
+
+[vars]
+DASHBOARD_TIMEZONE = "Asia/Shanghai"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ai-token-dashboard"
+database_id = "c2a87479-38fc-4942-b80c-0a7a323339dd"

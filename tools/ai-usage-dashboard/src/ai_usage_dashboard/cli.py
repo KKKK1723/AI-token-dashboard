@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .data import UsageDataError, load_usage_snapshot, resolve_timezone
+from .remote import load_remote_snapshot
 from .render import format_cost, write_dashboard_assets
 
 
@@ -21,7 +22,7 @@ def _parse_now(value: str | None, timezone_name: str) -> datetime | None:
 
 def build_parser(default_output_directory: Path) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate GitHub Native usage cards from CC Switch statistics."
+        description="Generate GitHub Native usage cards from an AI usage snapshot."
     )
     parser.add_argument(
         "--database",
@@ -34,6 +35,11 @@ def build_parser(default_output_directory: Path) -> argparse.ArgumentParser:
         type=Path,
         default=default_output_directory,
         help="Directory for generated light and dark SVG files.",
+    )
+    parser.add_argument(
+        "--snapshot-json",
+        type=Path,
+        help="Canonical summary JSON fetched from the sync service.",
     )
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--timezone", default="Asia/Shanghai")
@@ -60,17 +66,23 @@ def main(
     arguments = build_parser(output_default).parse_args(argv)
 
     try:
-        snapshot = load_usage_snapshot(
-            arguments.database,
-            now=_parse_now(arguments.now, arguments.timezone),
-            days=arguments.days,
-            timezone_name=arguments.timezone,
-            retries=arguments.retries,
-            retry_delay=arguments.retry_delay,
-        )
+        if arguments.snapshot_json is not None:
+            snapshot = load_remote_snapshot(
+                arguments.snapshot_json,
+                timezone_name=arguments.timezone,
+            )
+        else:
+            snapshot = load_usage_snapshot(
+                arguments.database,
+                now=_parse_now(arguments.now, arguments.timezone),
+                days=arguments.days,
+                timezone_name=arguments.timezone,
+                retries=arguments.retries,
+                retry_delay=arguments.retry_delay,
+            )
         if snapshot.requests == 0 and not arguments.allow_empty:
             raise UsageDataError(
-                "No CC Switch usage records were found in the selected window. "
+                "No usage records were found in the selected window. "
                 "Existing dashboard assets were left unchanged."
             )
         light_path, dark_path = write_dashboard_assets(
