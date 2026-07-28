@@ -14,7 +14,7 @@ import { importSeed, pruneLocalHistory } from "./records.js";
 import { installSchedule, removeSchedule } from "./scheduler.js";
 import { appendLog, createEmptyState, readJson, validateState, withFileLock, writeJsonAtomic } from "./storage.js";
 
-const VERSION = "2.1.0";
+const VERSION = "2.1.1";
 const PACKAGE_NAME = "@kkkk1723/ai-token-dashboard";
 const NPM_REGISTRY = "https://registry.npmjs.org/";
 
@@ -167,11 +167,12 @@ async function installAndRunSetup(paths, args) {
   return Number.isInteger(result.status) ? result.status : 1;
 }
 
-async function installAutomaticSync(options) {
+async function installAutomaticSync(paths, options) {
   if (options["no-schedule"]) return;
   await installSchedule({
     nodeExecutable: process.execPath,
     scriptPath: currentScriptPath(),
+    dataDirectory: paths.directory,
     at: options.at || "03:10",
   });
   console.log(`Installed 60-second local collection and daily sync at ${options.at || "03:10"}.`);
@@ -298,7 +299,7 @@ async function initialize(paths, options) {
   }
   await writeJsonAtomic(paths.config, config);
   await writeJsonAtomic(paths.state, state);
-  await installAutomaticSync(options);
+  await installAutomaticSync(paths, options);
   console.log(`Initialized device ${config.deviceName} (${config.deviceId}).`);
   if (!options["no-sync"]) await sync(paths);
 }
@@ -357,7 +358,7 @@ async function initializeFromPairing(paths, options) {
   };
   await writeJsonAtomic(paths.config, config);
   await writeJsonAtomic(paths.state, createEmptyState());
-  await installAutomaticSync(options);
+  await installAutomaticSync(paths, options);
   console.log(`Initialized paired device ${config.deviceName} (${config.deviceId}).`);
   if (!options["no-sync"]) await sync(paths);
 }

@@ -5,6 +5,7 @@ import path from "node:path";
 
 const SYNC_TASK_NAME = "AI-token Dashboard Sync";
 const COLLECT_TASK_NAME = "AI-token Dashboard Collect";
+const WINDOWS_RUNNER_NAME = "run-hidden.vbs";
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: "utf8", windowsHide: true, ...options });
@@ -25,16 +26,50 @@ function validateTime(at) {
   if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(at)) throw new Error("Schedule time must use HH:mm.");
 }
 
-export async function installSchedule({ nodeExecutable, scriptPath, at = "03:10", platform = process.platform }) {
+export function windowsHiddenRunnerSource() {
+  return [
+    "Option Explicit",
+    "Dim arguments, command, exitCode, index, shell",
+    "Set arguments = WScript.Arguments",
+    "If arguments.Count = 0 Then WScript.Quit 64",
+    "command = QuoteArgument(arguments(0))",
+    "For index = 1 To arguments.Count - 1",
+    "  command = command & \" \" & QuoteArgument(arguments(index))",
+    "Next",
+    "Set shell = CreateObject(\"WScript.Shell\")",
+    "exitCode = shell.Run(command, 0, True)",
+    "WScript.Quit exitCode",
+    "",
+    "Function QuoteArgument(value)",
+    "  If InStr(value, Chr(34)) > 0 Then WScript.Quit 65",
+    "  QuoteArgument = Chr(34) & value & Chr(34)",
+    "End Function",
+    "",
+  ].join("\r\n");
+}
+
+export async function installSchedule({
+  nodeExecutable,
+  scriptPath,
+  dataDirectory,
+  at = "03:10",
+  platform = process.platform,
+  runCommand = run,
+}) {
   validateTime(at);
   if (platform === "win32") {
+    if (!dataDirectory) throw new Error("A data directory is required for the Windows schedule.");
+    await fs.mkdir(dataDirectory, { recursive: true });
+    const runnerPath = path.join(dataDirectory, WINDOWS_RUNNER_NAME);
+    await fs.writeFile(runnerPath, windowsHiddenRunnerSource(), "utf8");
     const script = [
       "$time = [DateTime]::ParseExact($env:ATD_TIME, 'HH:mm', [Globalization.CultureInfo]::InvariantCulture)",
       "$runAt = (Get-Date).Date.AddHours($time.Hour).AddMinutes($time.Minute)",
-      "$syncArguments = '\"' + $env:ATD_SCRIPT + '\" sync'",
-      "$collectArguments = '\"' + $env:ATD_SCRIPT + '\" collect'",
-      "$syncAction = New-ScheduledTaskAction -Execute $env:ATD_NODE -Argument $syncArguments",
-      "$collectAction = New-ScheduledTaskAction -Execute $env:ATD_NODE -Argument $collectArguments",
+      "$wscript = Join-Path $env:WINDIR 'System32\\wscript.exe'",
+      "$syncArguments = '//B //NoLogo \"' + $env:ATD_RUNNER + '\" \"' + $env:ATD_NODE + '\" \"' + $env:ATD_SCRIPT + '\" sync'",
+      "$collectArguments = '//B //NoLogo \"' + $env:ATD_RUNNER + '\" \"' + $env:ATD_NODE + '\" \"' + $env:ATD_SCRIPT + '\" collect'",
+      "$syncAction = New-ScheduledTaskAction -Execute $wscript -Argument $syncArguments",
+      "$collectAction = New-ScheduledTaskAction -Execute $wscript -Argument $collectArguments",
       "$syncTrigger = New-ScheduledTaskTrigger -Daily -At $runAt",
       "$collectTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)",
       "$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 15)",
@@ -42,11 +77,12 @@ export async function installSchedule({ nodeExecutable, scriptPath, at = "03:10"
       "Register-ScheduledTask -TaskName $env:ATD_SYNC_TASK -Action $syncAction -Trigger $syncTrigger -Settings $settings -Principal $principal -Description 'Upload local AI CLI usage once per day' -Force | Out-Null",
       "Register-ScheduledTask -TaskName $env:ATD_COLLECT_TASK -Action $collectAction -Trigger $collectTrigger -Settings $settings -Principal $principal -Description 'Collect local AI CLI usage every minute' -Force | Out-Null",
     ].join("; ");
-    run("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
+    runCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
       env: {
         ...process.env,
         ATD_NODE: nodeExecutable,
         ATD_SCRIPT: scriptPath,
+        ATD_RUNNER: runnerPath,
         ATD_TIME: at,
         ATD_SYNC_TASK: SYNC_TASK_NAME,
         ATD_COLLECT_TASK: COLLECT_TASK_NAME,
