@@ -4,7 +4,7 @@
   "description": "Sync local AI CLI usage to a personal multi-device dashboard",
   "type": "module",
   "bin": {
-    "ai-token-dashboard": "./bin/ai-token-dashboard.js"
+    "ai-token-dashboard": "bin/ai-token-dashboard.js"
   },
   "files": [
     "bin",
