@@ -1,5 +1,17 @@
 import { summarizeRows, summaryDateRange, validateSyncPayload } from "./core.js";
 
+const PAIRING_TTL_MS = 10 * 60_000;
+const PAIRING_CODE = /^atdp_[A-Za-z0-9_-]{43}$/;
+const DEVICE_TOKEN = /^atdt_[A-Za-z0-9_-]{43}$/;
+const TEXT_ENCODER = new TextEncoder();
+
+class HttpError extends Error {
+  constructor(message, status = 400) {
+    super(message);
+    this.status = status;
+  }
+}
+
 function json(value, status = 200) {
   return new Response(JSON.stringify(value), {
     status,
@@ -7,24 +19,203 @@ function json(value, status = 200) {
   });
 }
 
-function authorized(request, expected) {
-  if (!expected) return false;
-  return request.headers.get("authorization") === `Bearer ${expected}`;
+function bearerToken(request) {
+  const match = /^Bearer ([^\s]+)$/.exec(request.headers.get("authorization") || "");
+  return match ? match[1] : null;
 }
 
+async function digestSecret(value) {
+  return crypto.subtle.digest("SHA-256", TEXT_ENCODER.encode(value));
+}
+
+function equalDigests(left, right) {
+  if (typeof crypto.subtle.timingSafeEqual === "function") {
+    return crypto.subtle.timingSafeEqual(left, right);
+  }
+  const leftBytes = new Uint8Array(left);
+  const rightBytes = new Uint8Array(right);
+  let difference = 0;
+  for (let index = 0; index < leftBytes.length; index += 1) {
+    difference |= leftBytes[index] ^ rightBytes[index];
+  }
+  return difference === 0;
+}
+
+async function authorized(request, expected) {
+  const provided = bearerToken(request);
+  if (!provided || !expected) return false;
+  const [providedHash, expectedHash] = await Promise.all([
+    digestSecret(provided),
+    digestSecret(expected),
+  ]);
+  return equalDigests(providedHash, expectedHash);
+}
+
+async function tokenHash(value) {
+  const digest = new Uint8Array(await digestSecret(value));
+  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function randomToken(prefix) {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  const encoded = btoa(String.fromCharCode(...bytes))
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/, "");
+  return prefix + encoded;
+}
+
+async function readJsonLimited(request, maximumBytes) {
+  const advertisedLength = Number(request.headers.get("content-length"));
+  if (Number.isFinite(advertisedLength) && advertisedLength > maximumBytes) {
+    throw new HttpError("request body is too large", 413);
+  }
+  if (!request.body) throw new HttpError("request body must be valid JSON");
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let received = 0;
+  let text = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    received += value.byteLength;
+    if (received > maximumBytes) {
+      await reader.cancel();
+      throw new HttpError("request body is too large", 413);
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  text += decoder.decode();
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new HttpError("request body must be valid JSON");
+  }
+}
+
+function validatePairRequest(value) {
+  if (!value || !PAIRING_CODE.test(value.code || "")) {
+    throw new HttpError("pairing code is invalid");
+  }
+  const deviceName = typeof value.deviceName === "string" ? value.deviceName.trim() : "";
+  if (!deviceName || deviceName.length > 120) {
+    throw new HttpError("deviceName must be a non-empty string of at most 120 characters");
+  }
+  if (
+    value.timezone != null &&
+    (typeof value.timezone !== "string" || !value.timezone || value.timezone.length > 80)
+  ) {
+    throw new HttpError("timezone must be a non-empty string of at most 80 characters");
+  }
+  return { code: value.code, deviceName, timezone: value.timezone || null };
+}
+
+async function issuePairingCode(request, env) {
+  if (!(await authorized(request, env.SYNC_KEY))) {
+    return json({ error: "unauthorized" }, 401);
+  }
+  const code = randomToken("atdp_");
+  const codeHash = await tokenHash(code);
+  const createdAt = new Date();
+  const expiresAt = new Date(createdAt.getTime() + PAIRING_TTL_MS);
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM pairing_codes WHERE expires_at <= ?1").bind(createdAt.toISOString()),
+    env.DB.prepare(
+      "INSERT INTO pairing_codes (code_hash, created_at, expires_at) VALUES (?1, ?2, ?3)",
+    ).bind(codeHash, createdAt.toISOString(), expiresAt.toISOString()),
+  ]);
+  return json({ ok: true, code, expiresAt: expiresAt.toISOString() });
+}
+
+async function redeemPairing(request, env) {
+  let pairing;
+  try {
+    pairing = validatePairRequest(await readJsonLimited(request, 16 * 1024));
+  } catch (error) {
+    return json({ error: error.message }, error.status || 400);
+  }
+  const accountTimezone = env.DASHBOARD_TIMEZONE || "Asia/Shanghai";
+  if (pairing.timezone && pairing.timezone !== accountTimezone) {
+    return json({ error: `timezone must be ${accountTimezone}` }, 400);
+  }
+
+  const deviceToken = randomToken("atdt_");
+  const [codeHash, deviceTokenHash] = await Promise.all([
+    tokenHash(pairing.code),
+    tokenHash(deviceToken),
+  ]);
+  const now = new Date().toISOString();
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO device_credentials (
+         token_hash, device_id, device_name, created_at, last_used_at, revoked_at
+       )
+       SELECT ?1, NULL, ?2, ?3, NULL, NULL
+       FROM pairing_codes
+       WHERE code_hash = ?4 AND expires_at > ?3`,
+    ).bind(deviceTokenHash, pairing.deviceName, now, codeHash),
+    env.DB.prepare("DELETE FROM pairing_codes WHERE code_hash = ?1").bind(codeHash),
+  ]);
+  if (results[0]?.meta?.changes !== 1) {
+    return json({ error: "pairing code is invalid, expired, or already used" }, 400);
+  }
+  return json({
+    ok: true,
+    deviceToken,
+    timezone: accountTimezone,
+  });
+}
+
+async function authorizeSync(request, env) {
+  const token = bearerToken(request);
+  if (!token) return null;
+  if (await authorized(request, env.SYNC_KEY)) return { kind: "master" };
+  if (!DEVICE_TOKEN.test(token)) return null;
+  const hash = await tokenHash(token);
+  const credential = await env.DB.prepare(
+    `SELECT device_id
+     FROM device_credentials
+     WHERE token_hash = ?1 AND revoked_at IS NULL`,
+  )
+    .bind(hash)
+    .first();
+  return credential ? { kind: "device", tokenHash: hash } : null;
+}
+
+async function bindDeviceCredential(env, authorization, payload, now) {
+  if (authorization.kind !== "device") return true;
+  const result = await env.DB.prepare(
+    `UPDATE device_credentials
+     SET device_id = COALESCE(device_id, ?1),
+         device_name = ?2,
+         last_used_at = ?3
+     WHERE token_hash = ?4
+       AND revoked_at IS NULL
+       AND (device_id IS NULL OR device_id = ?1)`,
+  )
+    .bind(payload.deviceId, payload.deviceName, now, authorization.tokenHash)
+    .run();
+  return result.meta.changes === 1;
+}
+
+
 async function syncUsage(request, env) {
-  if (!authorized(request, env.SYNC_KEY)) return json({ error: "unauthorized" }, 401);
+  const authorization = await authorizeSync(request, env);
+  if (!authorization) return json({ error: "unauthorized" }, 401);
   let payload;
   try {
-    payload = validateSyncPayload(await request.json());
+    payload = validateSyncPayload(await readJsonLimited(request, 1024 * 1024));
   } catch (error) {
-    return json({ error: error.message }, 400);
+    return json({ error: error.message }, error.status || 400);
   }
   const accountTimezone = env.DASHBOARD_TIMEZONE || "Asia/Shanghai";
   if (payload.timezone !== accountTimezone) {
     return json({ error: `timezone must be ${accountTimezone}` }, 400);
   }
   const now = new Date().toISOString();
+  if (!(await bindDeviceCredential(env, authorization, payload, now))) {
+    return json({ error: "device credential is already bound to another device" }, 403);
+  }
   await env.DB.prepare(
     `INSERT INTO devices (
        device_id, device_name, timezone, first_seen_at, last_seen_at, last_sequence, collector_version
@@ -79,7 +270,7 @@ async function syncUsage(request, env) {
 }
 
 async function getSummary(request, env) {
-  if (!authorized(request, env.READ_KEY)) return json({ error: "unauthorized" }, 401);
+  if (!(await authorized(request, env.READ_KEY))) return json({ error: "unauthorized" }, 401);
   const url = new URL(request.url);
   const days = Number(url.searchParams.get("days") || 30);
   const timezone = env.DASHBOARD_TIMEZONE || "Asia/Shanghai";
@@ -105,15 +296,31 @@ async function getSummary(request, env) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (request.method === "GET" && url.pathname === "/health") {
-      return json({ ok: true, service: "ai-token-dashboard" });
+    try {
+      if (request.method === "GET" && url.pathname === "/health") {
+        return json({ ok: true, service: "ai-token-dashboard" });
+      }
+      if (request.method === "POST" && url.pathname === "/v1/pairing-codes") {
+        return issuePairingCode(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/v1/pair") {
+        return redeemPairing(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/v1/sync") {
+        return syncUsage(request, env);
+      }
+      if (request.method === "GET" && url.pathname === "/v1/summary") {
+        return getSummary(request, env);
+      }
+      return json({ error: "not found" }, 404);
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: "request_failed",
+        method: request.method,
+        path: url.pathname,
+        message: error.message,
+      }));
+      return json({ error: "internal server error" }, 500);
     }
-    if (request.method === "POST" && url.pathname === "/v1/sync") {
-      return syncUsage(request, env);
-    }
-    if (request.method === "GET" && url.pathname === "/v1/summary") {
-      return getSummary(request, env);
-    }
-    return json({ error: "not found" }, 404);
   },
 };

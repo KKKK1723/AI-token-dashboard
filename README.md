@@ -32,13 +32,13 @@ Cloudflare Worker + D1
 GitHub Actions -> 原 Python 渲染器 -> 现有 SVG
 ```
 
-同一账户的所有设备使用相同 `SYNC_KEY`，但每台设备在 `init` 时生成独立的随机 `device_id`。服务端以 `device_id + 日期 + 来源 + 模型` 为唯一桶，并按设备同步序号覆盖绝对值；跨设备查询时再求和，因此重试不会翻倍，不同设备会正确累加。
+原设备保留主 `SYNC_KEY`，其他设备通过 10 分钟一次性配对码领取各自的设备 token，并生成独立随机 `device_id`。服务端以 `device_id + 日期 + 来源 + 模型` 为唯一桶，并按设备同步序号覆盖绝对值；跨设备查询时再求和，因此重试不会翻倍，不同设备会正确累加。
 
 ## 开始使用
 
 1. 按 [Worker 部署文档](./packages/worker/README.md)创建 D1、部署 Worker，并配置两个独立密钥。
 2. 在原设备按 [CLI 迁移文档](./packages/cli/README.md)导出一次 CCSwitch 种子并初始化。
-3. 其他设备使用同一 `SYNC_KEY` 初始化，但不再导入种子。
+3. 原设备运行 `ai-token-dashboard pair`，其他设备只执行输出的 `npx ... setup <pairing-string>` 命令。
 4. 在仓库 Secrets 中配置 `DASHBOARD_API_URL` 和 `DASHBOARD_READ_KEY`，手动运行一次 `Update AI usage dashboard` 工作流。
 
 CCSwitch 只用于首次保留已有历史；种子完成后可以退出或卸载。

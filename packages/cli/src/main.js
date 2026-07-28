@@ -1,34 +1,44 @@
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { uploadUsage } from "./api.js";
+import { createPairingCode, redeemPairingCode, uploadUsage } from "./api.js";
 import { collectUsage } from "./collector.js";
 import { protectSecret, revealSecret } from "./credentials.js";
+import { decodePairingBundle, encodePairingBundle, validateDeviceToken } from "./pairing.js";
 import { dashboardPaths, defaultClaudeDirectory, defaultCodexDirectory } from "./paths.js";
 import { importSeed, pruneLocalHistory } from "./records.js";
 import { installSchedule, removeSchedule } from "./scheduler.js";
 import { appendLog, createEmptyState, readJson, validateState, withFileLock, writeJsonAtomic } from "./storage.js";
 
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
+const PACKAGE_NAME = "@kkkk1723/ai-token-dashboard";
+const NPM_REGISTRY = "https://registry.npmjs.org/";
 
-function parseOptions(args) {
+function parseOptions(args, {
+  positionals = 0,
+  booleanOptions = ["no-schedule", "no-sync", "new-device"],
+  valueOptions = ["api-url", "key", "seed", "timezone", "device-name", "at"],
+} = {}) {
   const options = { _: [] };
-  const booleanOptions = new Set(["no-schedule", "no-sync", "new-device"]);
-  const valueOptions = new Set(["api-url", "key", "seed", "timezone", "device-name", "at"]);
+  const booleans = new Set(booleanOptions);
+  const values = new Set(valueOptions);
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (!argument.startsWith("--")) {
-      throw new Error("Unexpected argument: " + argument);
+      if (options._.length >= positionals) throw new Error("Unexpected argument: " + argument);
+      options._.push(argument);
+      continue;
     }
     const name = argument.slice(2);
-    if (booleanOptions.has(name)) {
+    if (booleans.has(name)) {
       options[name] = true;
       continue;
     }
-    if (!valueOptions.has(name)) throw new Error("Unknown option: --" + name);
+    if (!values.has(name)) throw new Error("Unknown option: --" + name);
     const value = args[index + 1];
     if (value == null || value.startsWith("--")) throw new Error(`Missing value for --${name}`);
     options[name] = value;
@@ -42,6 +52,8 @@ function help() {
 
 Usage:
   ai-token-dashboard init --api-url <url> --key <sync-key> [--seed <file>]
+  ai-token-dashboard pair
+  ai-token-dashboard setup <pairing-string> [--device-name <name>]
   ai-token-dashboard collect
   ai-token-dashboard sync
   ai-token-dashboard status
@@ -83,6 +95,86 @@ export function normalizeApiUrl(value) {
     throw new Error("--api-url must use HTTPS except for a localhost Worker.");
   }
   return parsed.toString().replace(/\/$/, "");
+}
+
+function parseSetupOptions(args) {
+  const options = parseOptions(args, {
+    positionals: 1,
+    booleanOptions: ["no-schedule", "no-sync"],
+    valueOptions: ["timezone", "device-name", "at"],
+  });
+  if (options._.length !== 1) throw new Error("A pairing string is required.");
+  return options;
+}
+
+function currentScriptPath() {
+  return fileURLToPath(new URL("../bin/ai-token-dashboard.js", import.meta.url));
+}
+
+function runNpm(args, { capture = false } = {}) {
+  const npmExecPath = process.env.npm_execpath;
+  const command = npmExecPath
+    ? process.execPath
+    : process.platform === "win32"
+      ? "npm.cmd"
+      : "npm";
+  const commandArgs = npmExecPath ? [npmExecPath, ...args] : args;
+  const result = spawnSync(command, commandArgs, {
+    encoding: "utf8",
+    windowsHide: true,
+    stdio: capture ? ["ignore", "pipe", "pipe"] : "inherit",
+    shell: !npmExecPath && process.platform === "win32",
+  });
+  if (result.error) throw new Error(`Unable to run npm: ${result.error.message}`);
+  if (result.status !== 0) {
+    const detail = (result.stderr || result.stdout || "").trim();
+    throw new Error(detail || `npm exited with status ${result.status}.`);
+  }
+  return capture ? result.stdout.trim() : "";
+}
+
+async function installAndRunSetup(paths, args) {
+  const options = parseSetupOptions(args);
+  const pairing = decodePairingBundle(options._[0]);
+  normalizeApiUrl(pairing.apiUrl);
+  if (await readJson(paths.config)) {
+    throw new Error("Dashboard is already initialized on this device; setup will not overwrite it.");
+  }
+
+  console.log(`Installing ${PACKAGE_NAME}@${VERSION} from the official npm registry...`);
+  runNpm([
+    "install",
+    "--global",
+    `${PACKAGE_NAME}@${VERSION}`,
+    `--registry=${NPM_REGISTRY}`,
+    "--no-audit",
+    "--no-fund",
+  ]);
+  const globalRoot = runNpm(["root", "--global"], { capture: true });
+  const scriptPath = path.join(
+    globalRoot,
+    "@kkkk1723",
+    "ai-token-dashboard",
+    "bin",
+    "ai-token-dashboard.js",
+  );
+  await fs.access(scriptPath);
+  const result = spawnSync(process.execPath, [scriptPath, "__setup", ...args], {
+    stdio: "inherit",
+    windowsHide: true,
+  });
+  if (result.error) throw new Error(`Unable to start the installed CLI: ${result.error.message}`);
+  return Number.isInteger(result.status) ? result.status : 1;
+}
+
+async function installAutomaticSync(options) {
+  if (options["no-schedule"]) return;
+  await installSchedule({
+    nodeExecutable: process.execPath,
+    scriptPath: currentScriptPath(),
+    at: options.at || "03:10",
+  });
+  console.log(`Installed 60-second local collection and daily sync at ${options.at || "03:10"}.`);
 }
 
 function collectionSummary(collection) {
@@ -174,12 +266,18 @@ async function initialize(paths, options) {
   const rawKey = options.key || process.env.AI_TOKEN_DASHBOARD_KEY;
   if (!apiUrlValue) throw new Error("--api-url is required.");
   const apiUrl = normalizeApiUrl(apiUrlValue);
+  if (options["new-device"] && existing?.credentialType === "device" && !rawKey) {
+    throw new Error(
+      "A paired device needs a new pairing code to replace its device identity.",
+    );
+  }
   if (!rawKey && !existing?.syncKey) throw new Error("--key or AI_TOKEN_DASHBOARD_KEY is required.");
   const timezone = options.timezone || existing?.timezone || "Asia/Shanghai";
   const config = {
     schemaVersion: 1,
     apiUrl,
     syncKey: rawKey ? protectSecret(rawKey) : existing.syncKey,
+    credentialType: rawKey ? "master" : existing?.credentialType || "master",
     deviceId: options["new-device"] || !existing?.deviceId ? randomUUID() : existing.deviceId,
     deviceName: options["device-name"] || existing?.deviceName || os.hostname(),
     timezone,
@@ -200,17 +298,67 @@ async function initialize(paths, options) {
   }
   await writeJsonAtomic(paths.config, config);
   await writeJsonAtomic(paths.state, state);
-  if (!options["no-schedule"]) {
-    await installSchedule({
-      nodeExecutable: process.execPath,
-      scriptPath: fileURLToPath(new URL("../bin/ai-token-dashboard.js", import.meta.url)),
-      at: options.at || "03:10",
-    });
-    console.log(
-      `Installed 60-second local collection and daily sync at ${options.at || "03:10"}.`,
-    );
-  }
+  await installAutomaticSync(options);
   console.log(`Initialized device ${config.deviceName} (${config.deviceId}).`);
+  if (!options["no-sync"]) await sync(paths);
+}
+
+async function printPairingCommand(paths) {
+  const { config } = await loadConfigured(paths);
+  if (config.credentialType === "device") {
+    throw new Error("Only a device initialized with the master sync key can create pairing codes.");
+  }
+  const response = await createPairingCode({
+    apiUrl: config.apiUrl,
+    key: revealSecret(config.syncKey),
+    version: VERSION,
+  });
+  const pairing = encodePairingBundle(config.apiUrl, response.code);
+  console.log(`Pairing code expires at ${response.expiresAt}.`);
+  console.log("Run this command on the new device:");
+  console.log(`npx --yes ${PACKAGE_NAME}@latest setup ${pairing}`);
+}
+
+async function initializeFromPairing(paths, options) {
+  if (await readJson(paths.config)) {
+    throw new Error("Dashboard is already initialized on this device; setup will not overwrite it.");
+  }
+  const pairing = decodePairingBundle(options._[0]);
+  const apiUrl = normalizeApiUrl(pairing.apiUrl);
+  const deviceName = options["device-name"] || os.hostname();
+  const response = await redeemPairingCode({
+    apiUrl,
+    code: pairing.code,
+    deviceName,
+    timezone: options.timezone,
+    version: VERSION,
+  });
+  const timezone = response.timezone;
+  if (typeof timezone !== "string" || !timezone || timezone.length > 80) {
+    throw new Error("Worker returned an invalid account timezone.");
+  }
+  if (options.timezone && options.timezone !== timezone) {
+    throw new Error(`Account timezone must be ${timezone}.`);
+  }
+  const config = {
+    schemaVersion: 1,
+    apiUrl,
+    syncKey: protectSecret(validateDeviceToken(response.deviceToken)),
+    credentialType: "device",
+    deviceId: randomUUID(),
+    deviceName,
+    timezone,
+    uploadDays: 45,
+    pricingOverrides: {},
+    sources: {
+      claude: defaultClaudeDirectory(),
+      codex: defaultCodexDirectory(),
+    },
+  };
+  await writeJsonAtomic(paths.config, config);
+  await writeJsonAtomic(paths.state, createEmptyState());
+  await installAutomaticSync(options);
+  console.log(`Initialized paired device ${config.deviceName} (${config.deviceId}).`);
   if (!options["no-sync"]) await sync(paths);
 }
 
@@ -221,6 +369,7 @@ async function status(paths) {
     deviceName: config.deviceName,
     apiUrl: config.apiUrl,
     timezone: config.timezone,
+    credentialType: config.credentialType || "master",
     lastSyncAt: state.lastSyncAt || null,
     syncSequence: state.syncSequence,
     trackedRecords: Object.keys(state.records).length,
@@ -242,8 +391,17 @@ export async function main(args) {
       console.log(VERSION);
       return 0;
     }
+    if (command === "setup") return installAndRunSetup(paths, rest);
     if (command === "init") await initialize(paths, parseOptions(rest));
-    else if (command === "collect") await collectLocal(paths);
+    else if (command === "__setup") {
+      await initializeFromPairing(paths, parseSetupOptions(rest));
+    } else if (command === "pair") {
+      parseOptions(rest, {
+        booleanOptions: [],
+        valueOptions: [],
+      });
+      await printPairingCommand(paths);
+    } else if (command === "collect") await collectLocal(paths);
     else if (command === "sync") await sync(paths);
     else if (command === "status") await status(paths);
     else if (command === "uninstall") {

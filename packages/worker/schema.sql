@@ -29,3 +29,22 @@ CREATE TABLE IF NOT EXISTS daily_usage (
 );
 
 CREATE INDEX IF NOT EXISTS idx_daily_usage_date ON daily_usage(usage_date);
+
+CREATE TABLE IF NOT EXISTS pairing_codes (
+    code_hash TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pairing_codes_expires_at ON pairing_codes(expires_at);
+
+CREATE TABLE IF NOT EXISTS device_credentials (
+    token_hash TEXT PRIMARY KEY,
+    device_id TEXT,
+    device_name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_credentials_device_id ON device_credentials(device_id);

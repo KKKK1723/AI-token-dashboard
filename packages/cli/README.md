@@ -51,33 +51,48 @@ ai-token-dashboard init `
 
 ## 增加其他设备
 
-在每台新设备安装 CLI，使用同一个 `SYNC_KEY`，但不要传 `--seed`：
+在已经完成初始化、持有主 `SYNC_KEY` 的原设备运行：
 
 ```powershell
-ai-token-dashboard init `
-  --api-url https://ai-token-dashboard.<account>.workers.dev `
-  --key <同一个 SYNC_KEY> `
-  --device-name laptop
+ai-token-dashboard pair
 ```
 
-不要复制另一台机器的 CLI 配置目录。每次独立 `init` 会生成随机 UUID 作为 `device_id`；它比硬件机器码稳定，也不会暴露硬件标识。设备名称只用于排查。
+命令会输出一条只在 10 分钟内有效、只能使用一次的新设备安装命令。在新设备直接运行它：
+
+```powershell
+npx --yes @kkkk1723/ai-token-dashboard@latest setup <pairing-string>
+```
+
+`setup` 会自动完成正式 npm 包的全局安装、领取独立设备凭据、生成随机 `device_id`、安装本地采集与每日同步任务，并执行首次同步。新设备不需要登录 Cloudflare、配置 GitHub Secrets，也不会拿到长期主 `SYNC_KEY`。
+
+可选参数：
+
+```powershell
+npx --yes @kkkk1723/ai-token-dashboard@latest setup <pairing-string> `
+  --device-name laptop `
+  --at 03:10
+```
+
+不要复制另一台机器的 CLI 配置目录或配对后的设备凭据。每台设备必须使用自己领取的凭据和随机 `device_id`。
 
 ## 命令
 
 ```text
+ai-token-dashboard pair
+ai-token-dashboard setup <pairing-string>
 ai-token-dashboard collect
 ai-token-dashboard sync
 ai-token-dashboard status
 ai-token-dashboard uninstall
 ```
 
-`uninstall` 只移除定时任务，保留配置与本地账本。重新安装或确实需要换设备 ID 时可执行：
+`uninstall` 只移除定时任务，保留配置与本地账本。持有主 `SYNC_KEY` 的原设备确实需要更换设备 ID 时可执行：
 
 ```powershell
 ai-token-dashboard init --new-device --api-url <url> --key <SYNC_KEY>
 ```
 
-已有设备丢失本地状态时必须使用 `--new-device`，否则服务器上的旧同步序号会阻止较小序号覆盖。
+配对设备不能复用已经绑定的设备 token 来更换 `device_id`。如果配对设备丢失本地状态，应先备份并清理该设备的本地配置，再由原设备重新运行 `pair`，使用新的配对命令初始化。
 
 ## 累计正确性
 
