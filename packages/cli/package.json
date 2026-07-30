@@ -1,6 +1,6 @@
 {
   "name": "@kkkk1723/ai-token-dashboard",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "Sync local AI CLI usage to a personal multi-device dashboard",
   "type": "module",
   "bin": {

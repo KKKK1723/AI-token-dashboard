@@ -14,7 +14,7 @@ import { importSeed, pruneLocalHistory } from "./records.js";
 import { installSchedule, removeSchedule } from "./scheduler.js";
 import { appendLog, createEmptyState, readJson, validateState, withFileLock, writeJsonAtomic } from "./storage.js";
 
-const VERSION = "2.1.1";
+const VERSION = "2.1.2";
 const PACKAGE_NAME = "@kkkk1723/ai-token-dashboard";
 const NPM_REGISTRY = "https://registry.npmjs.org/";
 
@@ -215,7 +215,10 @@ async function collectLocal(paths) {
     const { config, state } = await loadConfigured(paths);
     const collection = await collectUsage(config, state);
     const summary = collectionSummary(collection);
-    if (collection.changed) await writeJsonAtomic(paths.state, state);
+    if (collection.changed) {
+      state.needsSync = true;
+      await writeJsonAtomic(paths.state, state);
+    }
     const message =
       `Collected ${summary.imported} new request records from ` +
       `${collection.results.reduce((sum, result) => sum + result.changedFiles, 0)} changed files.`;
@@ -235,7 +238,8 @@ async function sync(paths) {
 
     const collection = await collectUsage(config, state);
     const summary = collectionSummary(collection);
-    if (!collection.changed && state.syncSequence > 0) {
+    if (collection.changed) state.needsSync = true;
+    if (!state.needsSync && state.syncSequence > 0) {
       console.log("No new local usage to sync.");
       return response;
     }
@@ -256,6 +260,9 @@ async function sync(paths) {
       retainFrom: collection.range.start,
       createdAt: new Date().toISOString(),
     };
+    // The pending payload is the durable snapshot for all changes seen so far.
+    // Any collection after this write will set needsSync again.
+    state.needsSync = false;
     await writeJsonAtomic(paths.state, state);
     return uploadPending(paths, config, state);
   }, { waitMs: 60_000 });
@@ -296,6 +303,7 @@ async function initialize(paths, options) {
       throw new Error("Migration seed timezone must be " + timezone + ".");
     }
     importSeed(state, seed);
+    state.needsSync = true;
   }
   await writeJsonAtomic(paths.config, config);
   await writeJsonAtomic(paths.state, state);
@@ -377,6 +385,7 @@ async function status(paths) {
     seedBuckets: Object.keys(state.seedBuckets).length,
     cutoffAt: state.cutoffAt,
     pendingSequence: state.pendingSync?.payload?.sequence || null,
+    needsSync: state.needsSync,
   }, null, 2));
 }
 

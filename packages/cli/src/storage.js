@@ -62,6 +62,7 @@ export function createEmptyState() {
     schemaVersion: 1,
     syncSequence: 0,
     pendingSync: null,
+    needsSync: false,
     cutoffAt: null,
     fileCursors: {},
     records: {},
@@ -78,8 +79,14 @@ export function validateState(value) {
   value.seedBuckets ||= {};
   value.syncSequence ||= 0;
   value.pendingSync ??= null;
+  // Older clients only tracked whether the current scan changed. Force one
+  // catch-up upload so usage already collected by their timer is not lost.
+  value.needsSync ??= true;
   if (!Number.isSafeInteger(value.syncSequence) || value.syncSequence < 0) {
     throw new Error("Local sync sequence is invalid.");
+  }
+  if (typeof value.needsSync !== "boolean") {
+    throw new Error("Local sync requirement is invalid.");
   }
   if (
     value.pendingSync &&
