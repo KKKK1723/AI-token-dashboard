@@ -5,6 +5,7 @@ async function requestJson({
   body = null,
   timeoutMs = 30_000,
   userAgent = "ai-token-dashboard",
+  method = "POST",
 }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -14,7 +15,7 @@ async function requestJson({
     if (key) headers.authorization = `Bearer ${key}`;
     if (body != null) headers["content-type"] = "application/json";
     const response = await fetch(url, {
-      method: "POST",
+      method,
       headers,
       body: body == null ? null : JSON.stringify(body),
       signal: controller.signal,
@@ -30,6 +31,36 @@ async function requestJson({
   } finally {
     clearTimeout(timer);
   }
+}
+
+export function getGithubOAuthConfig({ apiUrl, version, timeoutMs = 30_000 }) {
+  return requestJson({
+    apiUrl,
+    endpoint: "v1/oauth/github/config",
+    timeoutMs,
+    method: "GET",
+    userAgent: `ai-token-dashboard/${version}`,
+  });
+}
+
+export function exchangeGithubOAuth({
+  apiUrl,
+  code,
+  codeVerifier,
+  redirectUri,
+  deviceId,
+  deviceName,
+  timezone,
+  version,
+  timeoutMs = 30_000,
+}) {
+  return requestJson({
+    apiUrl,
+    endpoint: "v1/oauth/github/exchange",
+    body: { code, codeVerifier, redirectUri, deviceId, deviceName, timezone },
+    timeoutMs,
+    userAgent: `ai-token-dashboard/${version}`,
+  });
 }
 
 export function uploadUsage({ apiUrl, key, payload, timeoutMs = 30_000 }) {

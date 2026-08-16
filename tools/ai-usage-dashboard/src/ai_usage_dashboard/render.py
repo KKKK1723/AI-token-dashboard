@@ -153,7 +153,7 @@ def render_svg(snapshot: UsageSnapshot, theme_name: str) -> str:
   <text class="ui percentage" x="482" y="{y_position}" fill="{theme.muted}" text-anchor="end">0.0%</text>"""
             )
 
-    updated_at = snapshot.data_through or snapshot.generated_at
+    updated_at = snapshot.generated_at
     range_label = (
         f"{format_date(snapshot.window_start)} - {format_date(snapshot.window_end)}"
     )

@@ -52,7 +52,7 @@ test("Claude replacement rule mirrors CC Switch", () => {
   );
 });
 
-test("Claude collector freezes the first imported message record", async (t) => {
+test("Claude collector replaces a partial message with its completed snapshot", async (t) => {
   const root = await temporaryDirectory(t);
   const project = path.join(root, "projects", "sample");
   await fs.mkdir(project, { recursive: true });
@@ -81,7 +81,9 @@ test("Claude collector freezes the first imported message record", async (t) => 
   await fs.appendFile(file, `${JSON.stringify(base)}\n`, "utf8");
   const second = await collectClaudeUsage({ state, claudeDirectory: root, timezone: "Asia/Shanghai", pricingCatalog });
   assert.equal(second.imported, 0);
-  assert.equal(state.records["session:msg-1"].outputTokens, 1);
+  assert.equal(second.updated, 1);
+  assert.equal(state.records["session:msg-1"].outputTokens, 100);
+  assert.equal(state.records["session:msg-1"].stopReason, "end_turn");
 });
 
 test("Codex collector computes cumulative deltas and fresh input", async (t) => {
@@ -125,6 +127,133 @@ test("Codex replay matching and model normalization are deterministic", () => {
     ),
     2,
   );
+});
+
+test("Codex collector treats decreasing cumulative counters as a reset and keeps quota as a snapshot", async (t) => {
+  const root = await temporaryDirectory(t);
+  const sessions = path.join(root, "sessions", "2026", "07", "28");
+  await fs.mkdir(sessions, { recursive: true });
+  const thread = "019fa6c8-7519-7ba0-9145-b2bf35fec801";
+  const file = path.join(sessions, `rollout-2026-07-28T00-00-00-${thread}.jsonl`);
+  const rateLimits = {
+    limit_id: "codex",
+    primary: { used_percent: 12, window_minutes: 300, resets_at: 1785200000 },
+    secondary: { used_percent: 34, window_minutes: 10080, resets_at: 1785800000 },
+  };
+  const values = [
+    { timestamp: "2026-07-28T00:00:00Z", type: "session_meta", payload: { id: thread } },
+    { timestamp: "2026-07-28T00:00:01Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+    {
+      timestamp: "2026-07-28T00:00:02Z",
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: { total_token_usage: { input_tokens: 100, cached_input_tokens: 80, output_tokens: 10 } },
+        rate_limits: rateLimits,
+      },
+    },
+    {
+      timestamp: "2026-07-28T00:00:03Z",
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: { total_token_usage: { input_tokens: 20, cached_input_tokens: 5, output_tokens: 2 } },
+        rate_limits: rateLimits,
+      },
+    },
+  ];
+  await fs.writeFile(file, `${values.map((value) => JSON.stringify(value)).join("\n")}\n`, "utf8");
+  const state = createEmptyState();
+  const result = await collectCodexUsage({ state, codexDirectory: root, timezone: "Asia/Shanghai", pricingCatalog });
+  assert.equal(result.imported, 2);
+  assert.equal(result.counterResets, 1);
+  assert.equal(result.quotaUpdated, true);
+  assert.equal(state.quotaSnapshots.codex.observedAt, "2026-07-28T00:00:03.000Z");
+  assert.deepEqual(state.quotaSnapshots.codex.rateLimits, rateLimits);
+  const [bucket] = aggregateDailyBuckets(state, { start: "2026-07-28", end: "2026-07-28" });
+  assert.equal(bucket.inputTokens, 35);
+  assert.equal(bucket.cacheReadTokens, 85);
+  assert.equal(bucket.outputTokens, 12);
+});
+
+test("Codex collector separates cache writes from cache-inclusive input", async (t) => {
+  const root = await temporaryDirectory(t);
+  const sessions = path.join(root, "sessions", "2026", "07", "28");
+  await fs.mkdir(sessions, { recursive: true });
+  const thread = "019fa6c8-7519-7ba0-9145-b2bf35fec803";
+  const file = path.join(sessions, `rollout-2026-07-28T00-00-00-${thread}.jsonl`);
+  const values = [
+    { timestamp: "2026-07-28T00:00:00Z", type: "session_meta", payload: { id: thread } },
+    { timestamp: "2026-07-28T00:00:01Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+    {
+      timestamp: "2026-07-28T00:00:02Z",
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            input_tokens: 100,
+            cached_input_tokens: 30,
+            cache_write_input_tokens: 20,
+            output_tokens: 10,
+          },
+        },
+      },
+    },
+    {
+      timestamp: "2026-07-28T00:00:03Z",
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            input_tokens: 180,
+            cached_input_tokens: 50,
+            cache_write_input_tokens: 50,
+            output_tokens: 20,
+          },
+        },
+      },
+    },
+  ];
+  await fs.writeFile(file, `${values.map((value) => JSON.stringify(value)).join("\n")}\n`, "utf8");
+  const state = createEmptyState();
+  const result = await collectCodexUsage({
+    state,
+    codexDirectory: root,
+    timezone: "Asia/Shanghai",
+    pricingCatalog,
+  });
+  assert.equal(result.imported, 2);
+  assert.equal(result.counterAnomalies, 0);
+  const [bucket] = aggregateDailyBuckets(state, {
+    start: "2026-07-28",
+    end: "2026-07-28",
+  });
+  assert.equal(bucket.inputTokens, 80);
+  assert.equal(bucket.cacheReadTokens, 50);
+  assert.equal(bucket.cacheCreationTokens, 50);
+  assert.equal(bucket.outputTokens, 20);
+});
+
+test("Codex parser reports unsupported token schemas instead of counting zero", () => {
+  const parsed = codexInternals.parseCodexText(
+    [
+      JSON.stringify({
+        timestamp: "2026-07-28T00:00:00Z",
+        type: "session_meta",
+        payload: { id: "019fa6c8-7519-7ba0-9145-b2bf35fec802" },
+      }),
+      JSON.stringify({
+        timestamp: "2026-07-28T00:00:01Z",
+        type: "event_msg",
+        payload: { type: "token_count", info: { future_token_usage: { tokens: 10 } } },
+      }),
+    ].join("\n"),
+    "019fa6c8-7519-7ba0-9145-b2bf35fec802",
+  );
+  assert.equal(parsed.unsupportedEvents, 1);
+  assert.equal(parsed.hasBillableTokens, false);
 });
 
 test("migration seed and native records share an absolute daily bucket", () => {

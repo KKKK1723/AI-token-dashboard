@@ -4,8 +4,7 @@ export function recordKey(parts) {
   return JSON.stringify(parts);
 }
 
-export function addUsageRecord(state, id, record, pricingCatalog) {
-  if (state.records[id]) return { inserted: false, unknownModel: null };
+function normalizedUsageRecord(id, record, pricingCatalog) {
   for (const field of [
     "inputTokens",
     "outputTokens",
@@ -18,8 +17,55 @@ export function addUsageRecord(state, id, record, pricingCatalog) {
     }
   }
   const cost = calculateCostPicos(record, pricingCatalog);
-  state.records[id] = { ...record, costPicos: cost.costPicos };
-  return { inserted: true, unknownModel: cost.unknownModel };
+  return {
+    value: { ...record, costPicos: cost.costPicos },
+    unknownModel: cost.unknownModel,
+  };
+}
+
+function recordsEqual(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+export function upsertUsageRecord(
+  state,
+  id,
+  record,
+  pricingCatalog,
+  { shouldReplace = () => true } = {},
+) {
+  const normalized = normalizedUsageRecord(id, record, pricingCatalog);
+  const existing = state.records[id];
+  if (!existing) {
+    state.records[id] = normalized.value;
+    return {
+      inserted: true,
+      updated: false,
+      changed: true,
+      unknownModel: normalized.unknownModel,
+    };
+  }
+  if (!shouldReplace(existing, normalized.value) || recordsEqual(existing, normalized.value)) {
+    return {
+      inserted: false,
+      updated: false,
+      changed: false,
+      unknownModel: normalized.unknownModel,
+    };
+  }
+  state.records[id] = normalized.value;
+  return {
+    inserted: false,
+    updated: true,
+    changed: true,
+    unknownModel: normalized.unknownModel,
+  };
+}
+
+export function addUsageRecord(state, id, record, pricingCatalog) {
+  return upsertUsageRecord(state, id, record, pricingCatalog, {
+    shouldReplace: () => false,
+  });
 }
 
 function emptyBucket(record) {

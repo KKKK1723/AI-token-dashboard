@@ -34,6 +34,22 @@ test("sync payload validation rejects duplicate absolute buckets", () => {
   assert.throws(() => validateSyncPayload(value), /Duplicate bucket/);
 });
 
+test("v2 sync payload requires a bounded window and keeps every bucket inside it", () => {
+  const value = {
+    ...payload(),
+    schemaVersion: 2,
+    snapshotId: "019fa6c8-7519-7ba0-9145-b2bf35fec801",
+    windowStartDate: "2026-07-01",
+    windowEndDate: "2026-07-31",
+  };
+  assert.equal(validateSyncPayload(value).schemaVersion, 2);
+  value.buckets[0].date = "2026-08-01";
+  assert.throws(() => validateSyncPayload(value), /inside the sync window/);
+  value.buckets[0].date = "2026-07-28";
+  value.windowEndDate = "2026-02-31";
+  assert.throws(() => validateSyncPayload(value), /window dates are invalid/);
+});
+
 test("summary adds rows from different devices exactly once", () => {
   const rows = [
     {

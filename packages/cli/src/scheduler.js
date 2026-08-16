@@ -63,18 +63,16 @@ export async function installSchedule({
     const runnerPath = path.join(dataDirectory, WINDOWS_RUNNER_NAME);
     await fs.writeFile(runnerPath, windowsHiddenRunnerSource(), "utf8");
     const script = [
-      "$time = [DateTime]::ParseExact($env:ATD_TIME, 'HH:mm', [Globalization.CultureInfo]::InvariantCulture)",
-      "$runAt = (Get-Date).Date.AddHours($time.Hour).AddMinutes($time.Minute)",
       "$wscript = Join-Path $env:WINDIR 'System32\\wscript.exe'",
       "$syncArguments = '//B //NoLogo \"' + $env:ATD_RUNNER + '\" \"' + $env:ATD_NODE + '\" \"' + $env:ATD_SCRIPT + '\" sync'",
       "$collectArguments = '//B //NoLogo \"' + $env:ATD_RUNNER + '\" \"' + $env:ATD_NODE + '\" \"' + $env:ATD_SCRIPT + '\" collect'",
       "$syncAction = New-ScheduledTaskAction -Execute $wscript -Argument $syncArguments",
       "$collectAction = New-ScheduledTaskAction -Execute $wscript -Argument $collectArguments",
-      "$syncTrigger = New-ScheduledTaskTrigger -Daily -At $runAt",
+      "$syncTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration (New-TimeSpan -Days 3650)",
       "$collectTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)",
       "$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 15)",
       "$principal = New-ScheduledTaskPrincipal -UserId ($env:USERDOMAIN + '\\' + $env:USERNAME) -LogonType Interactive -RunLevel Limited",
-      "Register-ScheduledTask -TaskName $env:ATD_SYNC_TASK -Action $syncAction -Trigger $syncTrigger -Settings $settings -Principal $principal -Description 'Upload local AI CLI usage once per day' -Force | Out-Null",
+      "Register-ScheduledTask -TaskName $env:ATD_SYNC_TASK -Action $syncAction -Trigger $syncTrigger -Settings $settings -Principal $principal -Description 'Upload changed local AI CLI usage every ten minutes' -Force | Out-Null",
       "Register-ScheduledTask -TaskName $env:ATD_COLLECT_TASK -Action $collectAction -Trigger $collectTrigger -Settings $settings -Principal $principal -Description 'Collect local AI CLI usage every minute' -Force | Out-Null",
     ].join("; ");
     runCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
@@ -91,7 +89,6 @@ export async function installSchedule({
     return;
   }
   if (platform === "darwin") {
-    const [hour, minute] = at.split(":").map(Number);
     const launchAgents = path.join(os.homedir(), "Library", "LaunchAgents");
     const collectFile = path.join(launchAgents, "com.kkkk1723.ai-token-dashboard.collect.plist");
     const syncFile = path.join(launchAgents, "com.kkkk1723.ai-token-dashboard.sync.plist");
@@ -108,7 +105,8 @@ export async function installSchedule({
 <plist version="1.0"><dict>
 <key>Label</key><string>com.kkkk1723.ai-token-dashboard.sync</string>
 <key>ProgramArguments</key><array><string>${xml(nodeExecutable)}</string><string>${xml(scriptPath)}</string><string>sync</string></array>
-<key>StartCalendarInterval</key><dict><key>Hour</key><integer>${hour}</integer><key>Minute</key><integer>${minute}</integer></dict>
+<key>StartInterval</key><integer>600</integer>
+<key>RunAtLoad</key><true/>
 </dict></plist>\n`;
     await fs.mkdir(launchAgents, { recursive: true });
     await fs.writeFile(collectFile, collectPlist, { encoding: "utf8", mode: 0o600 });
@@ -130,7 +128,7 @@ export async function installSchedule({
   await fs.writeFile(collectService, `[Unit]\nDescription=Collect local AI CLI usage\n\n[Service]\nType=oneshot\nExecStart=${quote(nodeExecutable)} ${quote(scriptPath)} collect\n`, "utf8");
   await fs.writeFile(collectTimer, "[Unit]\nDescription=Collect local AI CLI usage every minute\n\n[Timer]\nOnBootSec=1min\nOnUnitActiveSec=1min\nAccuracySec=10s\n\n[Install]\nWantedBy=timers.target\n", "utf8");
   await fs.writeFile(syncService, `[Unit]\nDescription=Sync local AI CLI usage\n\n[Service]\nType=oneshot\nExecStart=${quote(nodeExecutable)} ${quote(scriptPath)} sync\n`, "utf8");
-  await fs.writeFile(syncTimer, `[Unit]\nDescription=Daily AI token dashboard sync\n\n[Timer]\nOnCalendar=*-*-* ${at}:00\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n`, "utf8");
+  await fs.writeFile(syncTimer, "[Unit]\nDescription=Sync changed AI token dashboard usage every ten minutes\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=10min\nAccuracySec=30s\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n", "utf8");
   run("systemctl", ["--user", "daemon-reload"]);
   run("systemctl", ["--user", "enable", "--now", "ai-token-dashboard-collect.timer", "ai-token-dashboard-sync.timer"]);
 }

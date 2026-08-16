@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { addUsageRecord } from "../records.js";
+import { upsertUsageRecord } from "../records.js";
 import { dateInTimezone } from "../time.js";
 
 const THREAD_REQUEST_PREFIX = "codex_session:thread-v1";
@@ -45,10 +45,11 @@ export function normalizeCodexModel(raw) {
 }
 
 function signatureCounters(value) {
-  if (!value || typeof value !== "object") return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   return {
     input: value.input_tokens ?? null,
     cachedInput: value.cached_input_tokens ?? value.cache_read_input_tokens ?? null,
+    cacheWrite: value.cache_write_input_tokens ?? value.cache_creation_input_tokens ?? null,
     output: value.output_tokens ?? null,
     reasoningOutput: value.reasoning_output_tokens ?? null,
     total: value.total_tokens ?? null,
@@ -63,21 +64,43 @@ function tokenSignature(info) {
   return signature.total || signature.last ? JSON.stringify(signature) : null;
 }
 
+function safeCounter(value) {
+  const result = Number(value ?? 0);
+  return Number.isSafeInteger(result) && result >= 0 ? result : null;
+}
+
 function cumulativeTokens(value) {
-  if (!value || typeof value !== "object") return null;
-  return {
-    input: Number(value.input_tokens || 0),
-    cachedInput: Number(value.cached_input_tokens ?? value.cache_read_input_tokens ?? 0),
-    output: Number(value.output_tokens || 0),
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const result = {
+    input: safeCounter(value.input_tokens),
+    cachedInput: safeCounter(value.cached_input_tokens ?? value.cache_read_input_tokens),
+    cacheWrite: safeCounter(
+      value.cache_write_input_tokens ?? value.cache_creation_input_tokens,
+    ),
+    output: safeCounter(value.output_tokens),
   };
+  if (Object.values(result).some((counter) => counter == null)) return null;
+  if (result.cachedInput > result.input) return null;
+  return result;
+}
+
+function countersDecreased(previous, current) {
+  return Boolean(
+    previous &&
+      (current.input < previous.input ||
+        current.cachedInput < previous.cachedInput ||
+        current.cacheWrite < previous.cacheWrite ||
+        current.output < previous.output),
+  );
 }
 
 function computeDelta(previous, current) {
-  if (!previous) return { ...current };
+  if (!previous || countersDecreased(previous, current)) return { ...current };
   return {
-    input: Math.max(0, current.input - previous.input),
-    cachedInput: Math.max(0, current.cachedInput - previous.cachedInput),
-    output: Math.max(0, current.output - previous.output),
+    input: current.input - previous.input,
+    cachedInput: current.cachedInput - previous.cachedInput,
+    cacheWrite: current.cacheWrite - previous.cacheWrite,
+    output: current.output - previous.output,
   };
 }
 
@@ -95,6 +118,17 @@ function explicitParent(payload) {
   return { kind: "parent", parentId };
 }
 
+function cloneRateLimits(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  try {
+    const serialized = JSON.stringify(value);
+    if (!serialized || serialized.length > 32 * 1024) return null;
+    return JSON.parse(serialized);
+  } catch {
+    return null;
+  }
+}
+
 function parseCodexText(text, rootThreadId) {
   const lines = text.split(/\r?\n/);
   if (lines.at(-1) === "") lines.pop();
@@ -104,16 +138,40 @@ function parseCodexText(text, rootThreadId) {
   let currentModel = "unknown";
   let previousTotal = null;
   let eventIndex = 0;
+  let latestRateLimit = null;
+  let processedLineOffset = lines.length;
+  let complete = true;
+  let relevantEvents = 0;
+  let malformedRelevantLines = 0;
+  let unsupportedEvents = 0;
+  let counterResets = 0;
+  let counterAnomalies = 0;
+  const issues = [];
   const tokenEvents = [];
+  const note = (line, message) => {
+    if (issues.length < 10) issues.push({ line, message });
+  };
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
-    if (!line.includes('"event_msg"') && !line.includes('"turn_context"') && !line.includes('"session_meta"')) continue;
-    if (line.includes('"event_msg"') && !line.includes('"token_count"')) continue;
+    const looksRelevant =
+      line.includes('"event_msg"') ||
+      line.includes('"turn_context"') ||
+      line.includes('"session_meta"') ||
+      line.includes('"token_count"');
+    if (!looksRelevant) continue;
     let value;
     try {
       value = JSON.parse(line);
     } catch {
+      const incompleteTail = index === lines.length - 1 && !/\r?\n$/.test(text);
+      if (incompleteTail) {
+        processedLineOffset = index;
+        complete = false;
+        break;
+      }
+      malformedRelevantLines += 1;
+      note(index + 1, "malformed Codex event JSON");
       continue;
     }
     if (value.type === "session_meta" && !rootMetaSeen) {
@@ -135,24 +193,57 @@ function parseCodexText(text, rootThreadId) {
       continue;
     }
     if (value.type !== "event_msg" || value.payload?.type !== "token_count") continue;
+    relevantEvents += 1;
+    const timestampMs = Date.parse(value.timestamp || "");
+    if (value.payload.rate_limits != null) {
+      const rateLimits = cloneRateLimits(value.payload.rate_limits);
+      if (rateLimits && Number.isFinite(timestampMs)) {
+        const observedAt = new Date(timestampMs).toISOString();
+        if (!latestRateLimit || observedAt >= latestRateLimit.observedAt) {
+          latestRateLimit = { observedAt, rateLimits };
+        }
+      } else {
+        unsupportedEvents += 1;
+        note(index + 1, "invalid Codex rate-limit snapshot");
+      }
+    }
     const info = value.payload.info;
-    if (!info) continue;
+    if (!info) {
+      if (value.payload.rate_limits == null) {
+        unsupportedEvents += 1;
+        note(index + 1, "Codex token event has neither usage nor rate limits");
+      }
+      continue;
+    }
     const signature = tokenSignature(info);
-    if (!signature) continue;
-    const inlineModel = info.model || info.model_name || value.payload.model;
-    if (inlineModel) currentModel = normalizeCodexModel(inlineModel);
     const total = info.total_token_usage;
     const last = info.last_token_usage;
     const cumulative = cumulativeTokens(total || last);
-    if (!cumulative) continue;
+    if (!signature || !cumulative || !Number.isFinite(timestampMs)) {
+      unsupportedEvents += 1;
+      note(index + 1, "unsupported Codex token usage schema");
+      continue;
+    }
+    const inlineModel = info.model || info.model_name || value.payload.model;
+    if (inlineModel) currentModel = normalizeCodexModel(inlineModel);
     let delta;
+    let reset = false;
     if (total) {
+      reset = countersDecreased(previousTotal, cumulative);
       delta = computeDelta(previousTotal, cumulative);
       previousTotal = cumulative;
+      if (reset) counterResets += 1;
     } else {
       delta = cumulative;
     }
-    delta.cachedInput = Math.min(delta.cachedInput, delta.input);
+    const cachedInput = Math.min(delta.cachedInput, delta.input);
+    const cacheWrite = Math.min(delta.cacheWrite, delta.input - cachedInput);
+    if (cachedInput !== delta.cachedInput || cacheWrite !== delta.cacheWrite) {
+      counterAnomalies += 1;
+      note(index + 1, "Codex cache counters exceed total input tokens");
+    }
+    delta.cachedInput = cachedInput;
+    delta.cacheWrite = cacheWrite;
     const nonzero = delta.input !== 0 || delta.cachedInput !== 0 || delta.output !== 0;
     if (nonzero) eventIndex += 1;
     tokenEvents.push({
@@ -161,7 +252,8 @@ function parseCodexText(text, rootThreadId) {
       delta,
       eventIndex: nonzero ? eventIndex : null,
       model: currentModel,
-      timestamp: value.timestamp || null,
+      timestamp: new Date(timestampMs).toISOString(),
+      reset,
     });
   }
   return {
@@ -170,8 +262,16 @@ function parseCodexText(text, rootThreadId) {
     rootTimestamp,
     parent,
     tokenEvents,
-    lineOffset: lines.length,
+    latestRateLimit,
+    lineOffset: processedLineOffset,
+    complete,
     hasBillableTokens: eventIndex > 0,
+    relevantEvents,
+    malformedRelevantLines,
+    unsupportedEvents,
+    counterResets,
+    counterAnomalies,
+    issues,
   };
 }
 
@@ -222,6 +322,16 @@ function timestampAfterCutoff(timestamp, cutoffAt) {
   return Number.isFinite(value) && value > Date.parse(cutoffAt);
 }
 
+function updateQuotaSnapshot(state, result, file, candidate) {
+  if (!candidate) return;
+  const next = { ...candidate, sourceFile: file };
+  const existing = state.quotaSnapshots.codex;
+  if (existing?.observedAt && existing.observedAt > next.observedAt) return;
+  if (JSON.stringify(existing) === JSON.stringify(next)) return;
+  state.quotaSnapshots.codex = next;
+  result.quotaUpdated = true;
+}
+
 // This is a JavaScript port of CC Switch 3.18.0 session_usage_codex.rs.
 export async function collectCodexUsage({
   state,
@@ -242,25 +352,65 @@ export async function collectCodexUsage({
     filesScanned: files.length,
     changedFiles: 0,
     imported: 0,
+    updated: 0,
     skipped: 0,
     deferred: 0,
+    relevantEvents: 0,
+    malformedRelevantLines: 0,
+    unsupportedEvents: 0,
+    counterResets: 0,
+    counterAnomalies: 0,
+    quotaUpdated: false,
     unknownModels: new Set(),
+    issues: [],
     errors: [],
+  };
+  const noteIssue = (issue) => {
+    if (result.issues.length < 10) result.issues.push(issue);
   };
   for (const file of files) {
     try {
       const stat = await fs.stat(file);
-      const cursor = state.fileCursors[file] || { lineOffset: 0, mtimeMs: 0, size: 0 };
-      if (stat.mtimeMs <= cursor.mtimeMs && stat.size === cursor.size) continue;
+      const cursor = state.fileCursors[file] || {
+        lineOffset: 0,
+        mtimeMs: 0,
+        size: 0,
+        complete: true,
+      };
+      if (
+        cursor.complete !== false &&
+        stat.mtimeMs <= cursor.mtimeMs &&
+        stat.size === cursor.size
+      ) {
+        continue;
+      }
       const rootThreadId = threadIdFromFilename(file);
       const parsed = parseCodexText(await fs.readFile(file, "utf8"), rootThreadId);
+      result.relevantEvents += parsed.relevantEvents;
+      result.malformedRelevantLines += parsed.malformedRelevantLines;
+      result.unsupportedEvents += parsed.unsupportedEvents;
+      result.counterResets += parsed.counterResets;
+      result.counterAnomalies += parsed.counterAnomalies;
+      for (const issue of parsed.issues) {
+        noteIssue(`${file}:${issue.line}: ${issue.message}`);
+      }
+      updateQuotaSnapshot(state, result, file, parsed.latestRateLimit);
       if (!parsed.hasBillableTokens) {
-        state.fileCursors[file] = { lineOffset: parsed.lineOffset, mtimeMs: stat.mtimeMs, size: stat.size, source: "codex" };
+        state.fileCursors[file] = {
+          lineOffset: parsed.lineOffset,
+          mtimeMs: stat.mtimeMs,
+          size: stat.size,
+          source: "codex",
+          complete: parsed.complete,
+        };
         result.changedFiles += 1;
         continue;
       }
       if (!rootThreadId || !parsed.rootMetaSeen || parsed.parent.kind === "deferred") {
         result.deferred += 1;
+        noteIssue(
+          `${file}: ${parsed.parent.reason || "Codex rollout identity is incomplete"}`,
+        );
         continue;
       }
       let replayPrefix = 0;
@@ -268,6 +418,7 @@ export async function collectCodexUsage({
         const candidates = rolloutIndex.get(parsed.parent.parentId);
         if (!candidates?.length || !parsed.rootTimestamp) {
           result.deferred += 1;
+          noteIssue(`${file}: parent rollout is not available yet`);
           continue;
         }
         const snapshots = [];
@@ -276,6 +427,7 @@ export async function collectCodexUsage({
         }
         if (snapshots.some((value) => JSON.stringify(value) !== JSON.stringify(snapshots[0]))) {
           result.deferred += 1;
+          noteIssue(`${file}: parent rollout copies disagree`);
           continue;
         }
         replayPrefix = matchingReplayPrefix(parsed.tokenEvents, snapshots[0]);
@@ -285,25 +437,27 @@ export async function collectCodexUsage({
         const event = parsed.tokenEvents[offset];
         if (event.eventIndex == null || offset < replayPrefix || event.lineOffset <= cursor.lineOffset) continue;
         if (!timestampAfterCutoff(event.timestamp, state.cutoffAt)) continue;
-        const occurredAt = new Date(event.timestamp || Date.now()).toISOString();
-        const freshInput = Math.max(0, event.delta.input - event.delta.cachedInput);
-        const insertion = addUsageRecord(
+        const freshInput =
+          event.delta.input - event.delta.cachedInput - event.delta.cacheWrite;
+        const insertion = upsertUsageRecord(
           state,
           `${THREAD_REQUEST_PREFIX}:${rootThreadId}:${event.eventIndex}`,
           {
-            date: dateInTimezone(occurredAt, timezone),
+            date: dateInTimezone(event.timestamp, timezone),
             source: "codex",
             model: event.model,
             requests: 1,
             inputTokens: freshInput,
             outputTokens: event.delta.output,
             cacheReadTokens: event.delta.cachedInput,
-            cacheCreationTokens: 0,
-            dataThrough: occurredAt,
+            cacheCreationTokens: event.delta.cacheWrite,
+            dataThrough: event.timestamp,
+            counterReset: event.reset,
           },
           pricingCatalog,
         );
         if (insertion.inserted) result.imported += 1;
+        else if (insertion.updated) result.updated += 1;
         else result.skipped += 1;
         if (insertion.unknownModel) result.unknownModels.add(insertion.unknownModel);
       }
@@ -312,6 +466,7 @@ export async function collectCodexUsage({
         mtimeMs: stat.mtimeMs,
         size: stat.size,
         source: "codex",
+        complete: parsed.complete,
       };
       result.changedFiles += 1;
     } catch (error) {
@@ -322,7 +477,9 @@ export async function collectCodexUsage({
 }
 
 export const codexInternals = {
+  cloneRateLimits,
   computeDelta,
+  countersDecreased,
   matchingReplayPrefix,
   parseCodexText,
   threadIdFromFilename,

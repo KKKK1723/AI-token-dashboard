@@ -3,6 +3,8 @@ import { summarizeRows, summaryDateRange, validateSyncPayload } from "./core.js"
 const PAIRING_TTL_MS = 10 * 60_000;
 const PAIRING_CODE = /^atdp_[A-Za-z0-9_-]{43}$/;
 const DEVICE_TOKEN = /^atdt_[A-Za-z0-9_-]{43}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const PKCE_VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/;
 const TEXT_ENCODER = new TextEncoder();
 
 class HttpError extends Error {
@@ -198,6 +200,357 @@ async function bindDeviceCredential(env, authorization, payload, now) {
   return result.meta.changes === 1;
 }
 
+function validateLoopbackRedirect(value) {
+  let redirect;
+  try {
+    redirect = new URL(value);
+  } catch {
+    throw new HttpError("redirectUri is invalid");
+  }
+  const port = Number(redirect.port);
+  if (
+    redirect.protocol !== "http:" ||
+    redirect.hostname !== "127.0.0.1" ||
+    redirect.pathname !== "/oauth/callback" ||
+    !Number.isInteger(port) ||
+    port < 1 ||
+    port > 65_535 ||
+    redirect.username ||
+    redirect.password ||
+    redirect.search ||
+    redirect.hash
+  ) {
+    throw new HttpError("redirectUri must be a 127.0.0.1 OAuth callback");
+  }
+  return redirect.toString();
+}
+
+function validateOAuthExchange(value) {
+  if (!value || typeof value !== "object") {
+    throw new HttpError("request body is invalid");
+  }
+  if (typeof value.code !== "string" || !value.code || value.code.length > 512) {
+    throw new HttpError("code is invalid");
+  }
+  if (!PKCE_VERIFIER.test(value.codeVerifier || "")) {
+    throw new HttpError("codeVerifier is invalid");
+  }
+  if (!UUID.test(value.deviceId || "")) {
+    throw new HttpError("deviceId must be a UUID");
+  }
+  const deviceName = typeof value.deviceName === "string" ? value.deviceName.trim() : "";
+  if (!deviceName || deviceName.length > 120) {
+    throw new HttpError("deviceName must be a non-empty string of at most 120 characters");
+  }
+  if (
+    value.timezone != null &&
+    (typeof value.timezone !== "string" || !value.timezone || value.timezone.length > 80)
+  ) {
+    throw new HttpError("timezone must be a non-empty string of at most 80 characters");
+  }
+  return {
+    code: value.code,
+    codeVerifier: value.codeVerifier,
+    redirectUri: validateLoopbackRedirect(value.redirectUri),
+    deviceId: value.deviceId.toLowerCase(),
+    deviceName,
+    timezone: value.timezone || null,
+  };
+}
+
+function githubHeaders(extra = {}) {
+  return {
+    accept: "application/vnd.github+json",
+    "user-agent": "ai-token-dashboard-worker",
+    "x-github-api-version": "2022-11-28",
+    ...extra,
+  };
+}
+
+async function revokeGithubToken(env, accessToken) {
+  const credentials = btoa(
+    `${env.GITHUB_OAUTH_CLIENT_ID}:${env.GITHUB_OAUTH_CLIENT_SECRET}`,
+  );
+  const response = await fetch(
+    `https://api.github.com/applications/${encodeURIComponent(env.GITHUB_OAUTH_CLIENT_ID)}/token`,
+    {
+      method: "DELETE",
+      headers: githubHeaders({
+        authorization: `Basic ${credentials}`,
+        "content-type": "application/json",
+      }),
+      body: JSON.stringify({ access_token: accessToken }),
+    },
+  );
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`GitHub token revocation returned HTTP ${response.status}`);
+  }
+}
+
+function githubOAuthConfigured(env) {
+  const allowedUserId = Number(env.GITHUB_ALLOWED_USER_ID);
+  return Boolean(
+    env.GITHUB_OAUTH_CLIENT_ID &&
+      env.GITHUB_OAUTH_CLIENT_SECRET &&
+      Number.isSafeInteger(allowedUserId) &&
+      allowedUserId > 0,
+  );
+}
+
+function githubOAuthConfig(env) {
+  if (!githubOAuthConfigured(env)) {
+    return json({ error: "GitHub OAuth is not configured" }, 503);
+  }
+  return json({
+    clientId: env.GITHUB_OAUTH_CLIENT_ID,
+    authorizeUrl: "https://github.com/login/oauth/authorize",
+  });
+}
+
+async function exchangeGithubCode(env, oauth) {
+  const response = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/x-www-form-urlencoded",
+      "user-agent": "ai-token-dashboard-worker",
+    },
+    body: new URLSearchParams({
+      client_id: env.GITHUB_OAUTH_CLIENT_ID,
+      client_secret: env.GITHUB_OAUTH_CLIENT_SECRET,
+      code: oauth.code,
+      redirect_uri: oauth.redirectUri,
+      code_verifier: oauth.codeVerifier,
+    }),
+  });
+  const value = await response.json().catch(() => ({}));
+  if (
+    !response.ok ||
+    value.error ||
+    typeof value.access_token !== "string" ||
+    (value.scope != null && typeof value.scope !== "string")
+  ) {
+    throw new HttpError("GitHub authorization code exchange failed", 401);
+  }
+  return {
+    accessToken: value.access_token,
+    scope: value.scope || "",
+  };
+}
+
+async function githubIdentity(accessToken) {
+  const response = await fetch("https://api.github.com/user", {
+    headers: githubHeaders({ authorization: `Bearer ${accessToken}` }),
+  });
+  const value = await response.json().catch(() => ({}));
+  if (!response.ok || !Number.isSafeInteger(value.id)) {
+    throw new HttpError("Unable to verify the GitHub account", 502);
+  }
+  return value;
+}
+
+async function exchangeGithubOAuth(request, env) {
+  if (!githubOAuthConfigured(env)) {
+    return json({ error: "GitHub OAuth is not configured" }, 503);
+  }
+  let oauth;
+  try {
+    oauth = validateOAuthExchange(await readJsonLimited(request, 32 * 1024));
+  } catch (error) {
+    return json({ error: error.message }, error.status || 400);
+  }
+  const accountTimezone = env.DASHBOARD_TIMEZONE || "Asia/Shanghai";
+  if (oauth.timezone && oauth.timezone !== accountTimezone) {
+    return json({ error: `timezone must be ${accountTimezone}` }, 400);
+  }
+
+  let accessToken = null;
+  try {
+    const authorization = await exchangeGithubCode(env, oauth);
+    accessToken = authorization.accessToken;
+    if (authorization.scope.trim()) {
+      throw new HttpError("GitHub authorization granted unexpected scopes", 403);
+    }
+    const identity = await githubIdentity(accessToken);
+    if (identity.id !== Number(env.GITHUB_ALLOWED_USER_ID)) {
+      throw new HttpError("This GitHub account is not authorized", 403);
+    }
+    await revokeGithubToken(env, accessToken);
+    accessToken = null;
+    const deviceToken = randomToken("atdt_");
+    const deviceTokenHash = await tokenHash(deviceToken);
+    const now = new Date().toISOString();
+    await env.DB.prepare(
+      `INSERT INTO device_credentials (
+         token_hash, device_id, device_name, created_at, last_used_at, revoked_at
+       ) VALUES (?1, ?2, ?3, ?4, NULL, NULL)`,
+    )
+      .bind(deviceTokenHash, oauth.deviceId, oauth.deviceName, now)
+      .run();
+    return json({
+      ok: true,
+      deviceToken,
+      timezone: accountTimezone,
+      github: { id: identity.id, login: identity.login || null },
+    });
+  } catch (error) {
+    if (error instanceof HttpError) {
+      return json({ error: error.message }, error.status);
+    }
+    if (error.message?.startsWith("GitHub token revocation returned")) {
+      return json({ error: "Unable to finalize GitHub authorization" }, 502);
+    }
+    throw error;
+  } finally {
+    if (accessToken) {
+      await revokeGithubToken(env, accessToken).catch((error) => {
+        console.error(JSON.stringify({
+          event: "github_token_revoke_failed",
+          message: error.message,
+        }));
+      });
+    }
+  }
+}
+
+function syncResponse(payload, { idempotent = false } = {}) {
+  return json({
+    ok: true,
+    deviceId: payload.deviceId,
+    sequence: payload.sequence,
+    snapshotId: payload.snapshotId,
+    buckets: payload.buckets.length,
+    idempotent,
+  });
+}
+
+async function matchingSyncRun(env, payload, payloadHash) {
+  const result = await env.DB.prepare(
+    `SELECT snapshot_id, sequence, payload_hash
+     FROM sync_runs
+     WHERE device_id = ?1 AND (snapshot_id = ?2 OR sequence = ?3)`,
+  )
+    .bind(payload.deviceId, payload.snapshotId, payload.sequence)
+    .all();
+  const runs = result.results || [];
+  const exact = runs.some(
+    (run) =>
+      run.snapshot_id === payload.snapshotId &&
+      Number(run.sequence) === payload.sequence &&
+      run.payload_hash === payloadHash,
+  );
+  return { exists: runs.length > 0, exact };
+}
+
+async function syncUsageV2(env, payload, now) {
+  const payloadHash = await tokenHash(JSON.stringify(payload));
+  let prior = await matchingSyncRun(env, payload, payloadHash);
+  if (prior.exact) return syncResponse(payload, { idempotent: true });
+  if (prior.exists) {
+    return json({ error: "sequence or snapshotId already exists with different content" }, 409);
+  }
+  const device = await env.DB.prepare(
+    "SELECT last_sequence FROM devices WHERE device_id = ?1",
+  )
+    .bind(payload.deviceId)
+    .first();
+  if (device && Number(device.last_sequence) >= payload.sequence) {
+    return json({ error: "sequence must be greater than the device's last sequence" }, 409);
+  }
+
+  const bucketJson = JSON.stringify(payload.buckets);
+  const statements = [
+    env.DB.prepare(
+      `INSERT INTO devices (
+         device_id, device_name, timezone, first_seen_at, last_seen_at, last_sequence, collector_version
+       ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6)
+       ON CONFLICT(device_id) DO UPDATE SET
+         device_name = excluded.device_name,
+         timezone = excluded.timezone,
+         last_seen_at = excluded.last_seen_at,
+         last_sequence = excluded.last_sequence,
+         collector_version = excluded.collector_version
+       WHERE excluded.last_sequence > devices.last_sequence`,
+    ).bind(
+      payload.deviceId,
+      payload.deviceName,
+      payload.timezone,
+      now,
+      payload.sequence,
+      payload.collectorVersion,
+    ),
+    env.DB.prepare(
+      `INSERT INTO sync_runs (
+         device_id, snapshot_id, sequence, payload_hash, window_start_date,
+         window_end_date, bucket_count, created_at
+       )
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+       WHERE (SELECT last_sequence FROM devices WHERE device_id = ?1) = ?3`,
+    ).bind(
+      payload.deviceId,
+      payload.snapshotId,
+      payload.sequence,
+      payloadHash,
+      payload.windowStartDate,
+      payload.windowEndDate,
+      payload.buckets.length,
+      now,
+    ),
+    env.DB.prepare(
+      `DELETE FROM daily_usage
+       WHERE device_id = ?1
+         AND usage_date >= ?2
+         AND usage_date <= ?3
+         AND (SELECT last_sequence FROM devices WHERE device_id = ?1) = ?4`,
+    ).bind(
+      payload.deviceId,
+      payload.windowStartDate,
+      payload.windowEndDate,
+      payload.sequence,
+    ),
+    env.DB.prepare(
+      `INSERT INTO daily_usage (
+         device_id, usage_date, source, model, requests, input_tokens, output_tokens,
+         cache_read_tokens, cache_creation_tokens, cost_picos, data_through, sequence, updated_at
+       )
+       SELECT ?1,
+              json_extract(value, '$.date'),
+              json_extract(value, '$.source'),
+              json_extract(value, '$.model'),
+              json_extract(value, '$.requests'),
+              json_extract(value, '$.inputTokens'),
+              json_extract(value, '$.outputTokens'),
+              json_extract(value, '$.cacheReadTokens'),
+              json_extract(value, '$.cacheCreationTokens'),
+              CAST(json_extract(value, '$.costPicos') AS TEXT),
+              json_extract(value, '$.dataThrough'),
+              ?3,
+              ?4
+       FROM json_each(?2)
+       WHERE (SELECT last_sequence FROM devices WHERE device_id = ?1) = ?3`,
+    ).bind(payload.deviceId, bucketJson, payload.sequence, now),
+  ];
+  try {
+    const results = await env.DB.batch(statements);
+    if (results[1]?.meta?.changes !== 1) {
+      prior = await matchingSyncRun(env, payload, payloadHash);
+      if (prior.exact) return syncResponse(payload, { idempotent: true });
+      if (prior.exists) {
+        return json({ error: "sequence or snapshotId already exists with different content" }, 409);
+      }
+      return json({ error: "sequence must be greater than the device's last sequence" }, 409);
+    }
+  } catch (error) {
+    prior = await matchingSyncRun(env, payload, payloadHash);
+    if (prior.exact) return syncResponse(payload, { idempotent: true });
+    if (prior.exists) {
+      return json({ error: "sequence or snapshotId already exists with different content" }, 409);
+    }
+    throw error;
+  }
+  return syncResponse(payload);
+}
+
 
 async function syncUsage(request, env) {
   const authorization = await authorizeSync(request, env);
@@ -215,6 +568,9 @@ async function syncUsage(request, env) {
   const now = new Date().toISOString();
   if (!(await bindDeviceCredential(env, authorization, payload, now))) {
     return json({ error: "device credential is already bound to another device" }, 403);
+  }
+  if (payload.schemaVersion === 2) {
+    return syncUsageV2(env, payload, now);
   }
   await env.DB.prepare(
     `INSERT INTO devices (
@@ -305,6 +661,12 @@ export default {
       }
       if (request.method === "POST" && url.pathname === "/v1/pair") {
         return redeemPairing(request, env);
+      }
+      if (request.method === "GET" && url.pathname === "/v1/oauth/github/config") {
+        return githubOAuthConfig(env);
+      }
+      if (request.method === "POST" && url.pathname === "/v1/oauth/github/exchange") {
+        return exchangeGithubOAuth(request, env);
       }
       if (request.method === "POST" && url.pathname === "/v1/sync") {
         return syncUsage(request, env);

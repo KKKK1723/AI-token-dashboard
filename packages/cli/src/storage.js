@@ -57,6 +57,17 @@ export async function withFileLock(file, callback, { waitMs = 0, pollMs = 250 } 
   }
 }
 
+function createDiagnostics() {
+  return {
+    status: "unknown",
+    lastCollectionAt: null,
+    lastCollectionStatus: null,
+    lastReconciliation: null,
+    sources: {},
+    issues: [],
+  };
+}
+
 export function createEmptyState() {
   return {
     schemaVersion: 1,
@@ -67,6 +78,8 @@ export function createEmptyState() {
     fileCursors: {},
     records: {},
     seedBuckets: {},
+    quotaSnapshots: {},
+    diagnostics: createDiagnostics(),
   };
 }
 
@@ -77,6 +90,14 @@ export function validateState(value) {
   value.fileCursors ||= {};
   value.records ||= {};
   value.seedBuckets ||= {};
+  value.quotaSnapshots ||= {};
+  value.diagnostics ||= createDiagnostics();
+  value.diagnostics.status ||= "unknown";
+  value.diagnostics.lastCollectionAt ??= null;
+  value.diagnostics.lastCollectionStatus ??= null;
+  value.diagnostics.lastReconciliation ??= null;
+  value.diagnostics.sources ||= {};
+  value.diagnostics.issues ||= [];
   value.syncSequence ||= 0;
   value.pendingSync ??= null;
   // Older clients only tracked whether the current scan changed. Force one
@@ -88,6 +109,12 @@ export function validateState(value) {
   if (typeof value.needsSync !== "boolean") {
     throw new Error("Local sync requirement is invalid.");
   }
+  if (!value.quotaSnapshots || typeof value.quotaSnapshots !== "object") {
+    throw new Error("Local quota snapshot state is invalid.");
+  }
+  if (!Array.isArray(value.diagnostics.issues)) {
+    throw new Error("Local diagnostics state is invalid.");
+  }
   if (
     value.pendingSync &&
     value.pendingSync.payload?.sequence !== value.syncSequence + 1
@@ -96,3 +123,5 @@ export function validateState(value) {
   }
   return value;
 }
+
+export const storageInternals = { createDiagnostics };

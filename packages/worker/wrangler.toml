@@ -2,8 +2,14 @@ name = "ai-token-dashboard"
 main = "src/index.js"
 compatibility_date = "2026-07-28"
 
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 [vars]
 DASHBOARD_TIMEZONE = "Asia/Shanghai"
+GITHUB_ALLOWED_USER_ID = "181867828"
+GITHUB_OAUTH_CLIENT_ID = "Ov23liOhYMdozeZ6pa6E"
 
 [[d1_databases]]
 binding = "DB"

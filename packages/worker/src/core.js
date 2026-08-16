@@ -3,6 +3,12 @@ const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const SOURCE = /^[a-z][a-z0-9_-]{0,31}$/;
 const DECIMAL_INTEGER = /^\d+$/;
 
+function validDate(value) {
+  if (!DATE.test(value || "")) return false;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
 function requireNonnegativeInteger(value, field) {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error(`${field} must be a nonnegative safe integer.`);
@@ -18,7 +24,9 @@ function requireText(value, field, maximum) {
 }
 
 export function validateSyncPayload(value) {
-  if (!value || value.schemaVersion !== 1) throw new Error("Unsupported sync schema version.");
+  if (!value || ![1, 2].includes(value.schemaVersion)) {
+    throw new Error("Unsupported sync schema version.");
+  }
   if (!UUID.test(value.deviceId || "")) throw new Error("deviceId must be a UUID.");
   requireText(value.deviceName, "deviceName", 120);
   requireText(value.timezone, "timezone", 80);
@@ -31,7 +39,7 @@ export function validateSyncPayload(value) {
   }
   const keys = new Set();
   const buckets = value.buckets.map((bucket, index) => {
-    if (!DATE.test(bucket.date || "")) throw new Error(`buckets[${index}].date is invalid.`);
+    if (!validDate(bucket.date)) throw new Error(`buckets[${index}].date is invalid.`);
     if (!SOURCE.test(bucket.source || "")) throw new Error(`buckets[${index}].source is invalid.`);
     requireText(bucket.model, `buckets[${index}].model`, 160);
     if (!DECIMAL_INTEGER.test(String(bucket.costPicos ?? ""))) {
@@ -57,8 +65,8 @@ export function validateSyncPayload(value) {
     keys.add(key);
     return normalized;
   });
-  return {
-    schemaVersion: 1,
+  const normalized = {
+    schemaVersion: value.schemaVersion,
     deviceId: value.deviceId.toLowerCase(),
     deviceName: value.deviceName,
     timezone: value.timezone,
@@ -66,6 +74,34 @@ export function validateSyncPayload(value) {
     sequence: value.sequence,
     buckets,
   };
+  if (value.schemaVersion === 2) {
+    if (!UUID.test(value.snapshotId || "")) {
+      throw new Error("snapshotId must be a UUID.");
+    }
+    if (!validDate(value.windowStartDate) || !validDate(value.windowEndDate)) {
+      throw new Error("sync window dates are invalid.");
+    }
+    const windowDays =
+      (Date.parse(`${value.windowEndDate}T00:00:00Z`) -
+        Date.parse(`${value.windowStartDate}T00:00:00Z`)) /
+        86_400_000 +
+      1;
+    if (windowDays < 1 || windowDays > 90) {
+      throw new Error("sync window must contain between 1 and 90 days.");
+    }
+    if (
+      buckets.some(
+        (bucket) =>
+          bucket.date < value.windowStartDate || bucket.date > value.windowEndDate,
+      )
+    ) {
+      throw new Error("every bucket date must be inside the sync window.");
+    }
+    normalized.snapshotId = value.snapshotId.toLowerCase();
+    normalized.windowStartDate = value.windowStartDate;
+    normalized.windowEndDate = value.windowEndDate;
+  }
+  return normalized;
 }
 
 function dateInTimezone(date, timezone) {

@@ -1,15 +1,17 @@
 {
   "name": "ai-token-dashboard-worker",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "db:init:local": "wrangler d1 execute ai-token-dashboard --local --file=schema.sql",
-    "db:init:remote": "wrangler d1 execute ai-token-dashboard --remote --file=schema.sql"
+    "db:init:remote": "wrangler d1 execute ai-token-dashboard --remote --file=schema.sql",
+    "db:migrate:local": "wrangler d1 migrations apply ai-token-dashboard --local",
+    "db:migrate:remote": "wrangler d1 migrations apply ai-token-dashboard --remote"
   },
   "devDependencies": {
-    "wrangler": "^4.26.0"
+    "wrangler": "^4.123.0"
   }
 }

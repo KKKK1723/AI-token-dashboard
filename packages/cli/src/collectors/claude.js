@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { addUsageRecord } from "../records.js";
+import { upsertUsageRecord } from "../records.js";
 import { dateInTimezone } from "../time.js";
 
 async function directoryEntries(directory) {
@@ -70,8 +70,17 @@ function timestampAfterCutoff(timestamp, cutoffAt) {
   return Number.isFinite(value) && value > Date.parse(cutoffAt);
 }
 
-// This mirrors CC Switch 3.18.0 session_usage.rs: incremental line cursors,
-// message.id deduplication, stop_reason preference, then largest output count.
+function usageCounter(value) {
+  const result = Number(value ?? 0);
+  return Number.isSafeInteger(result) && result >= 0 ? result : null;
+}
+
+function noteIssue(result, issue) {
+  if (result.issues.length < 10) result.issues.push(issue);
+}
+
+// This mirrors CC Switch 3.18.0 session_usage.rs while allowing a later,
+// completed snapshot of the same message to correct an earlier partial one.
 export async function collectClaudeUsage({
   state,
   claudeDirectory,
@@ -83,39 +92,82 @@ export async function collectClaudeUsage({
     filesScanned: 0,
     changedFiles: 0,
     imported: 0,
+    updated: 0,
     skipped: 0,
+    relevantEvents: 0,
+    malformedRelevantLines: 0,
+    unsupportedEvents: 0,
     unknownModels: new Set(),
+    issues: [],
     errors: [],
   };
   for (const file of await collectClaudeFiles(claudeDirectory)) {
     result.filesScanned += 1;
     try {
       const stat = await fs.stat(file);
-      const cursor = state.fileCursors[file] || { lineOffset: 0, mtimeMs: 0, size: 0 };
-      if (stat.mtimeMs <= cursor.mtimeMs && stat.size === cursor.size) continue;
-      const lines = parseLines(await fs.readFile(file, "utf8"));
+      const cursor = state.fileCursors[file] || {
+        lineOffset: 0,
+        mtimeMs: 0,
+        size: 0,
+        complete: true,
+      };
+      if (
+        cursor.complete !== false &&
+        stat.mtimeMs <= cursor.mtimeMs &&
+        stat.size === cursor.size
+      ) {
+        continue;
+      }
+      const text = await fs.readFile(file, "utf8");
+      const lines = parseLines(text);
       const start = lines.length < cursor.lineOffset ? 0 : cursor.lineOffset;
       const messages = new Map();
+      let processedLineOffset = lines.length;
+      let complete = true;
       for (let index = start; index < lines.length; index += 1) {
         let value;
         try {
           value = JSON.parse(lines[index]);
         } catch {
+          const incompleteTail = index === lines.length - 1 && !/\r?\n$/.test(text);
+          if (incompleteTail) {
+            processedLineOffset = index;
+            complete = false;
+            break;
+          }
+          if (lines[index].includes('"assistant"') || lines[index].includes('"usage"')) {
+            result.malformedRelevantLines += 1;
+            noteIssue(result, `${file}:${index + 1}: malformed Claude usage JSON`);
+          }
           continue;
         }
         if (value?.type !== "assistant") continue;
+        result.relevantEvents += 1;
         const message = value.message;
         const usage = message?.usage;
-        if (!message?.id || !usage) continue;
+        const timestampMs = Date.parse(value.timestamp || "");
+        if (!message?.id || !usage || !Number.isFinite(timestampMs)) {
+          result.unsupportedEvents += 1;
+          noteIssue(result, `${file}:${index + 1}: incomplete Claude assistant usage event`);
+          continue;
+        }
+        const counters = {
+          inputTokens: usageCounter(usage.input_tokens),
+          outputTokens: usageCounter(usage.output_tokens),
+          cacheReadTokens: usageCounter(usage.cache_read_input_tokens),
+          cacheCreationTokens: usageCounter(usage.cache_creation_input_tokens),
+        };
+        if (Object.values(counters).some((counter) => counter == null)) {
+          result.unsupportedEvents += 1;
+          noteIssue(result, `${file}:${index + 1}: invalid Claude token counters`);
+          continue;
+        }
         const parsed = {
           messageId: String(message.id),
           model: String(message.model || "unknown"),
-          inputTokens: Number(usage.input_tokens || 0),
-          outputTokens: Number(usage.output_tokens || 0),
-          cacheReadTokens: Number(usage.cache_read_input_tokens || 0),
-          cacheCreationTokens: Number(usage.cache_creation_input_tokens || 0),
+          ...counters,
           stopReason: message.stop_reason ?? null,
-          timestamp: value.timestamp || null,
+          timestamp: new Date(timestampMs).toISOString(),
         };
         if (shouldReplaceClaudeUsage(messages.get(parsed.messageId), parsed)) {
           messages.set(parsed.messageId, parsed);
@@ -129,12 +181,11 @@ export async function collectClaudeUsage({
           message.cacheReadTokens > 0 ||
           message.cacheCreationTokens > 0;
         if (!hasTokens || !timestampAfterCutoff(message.timestamp, state.cutoffAt)) continue;
-        const occurredAt = new Date(message.timestamp || Date.now()).toISOString();
-        const insertion = addUsageRecord(
+        const insertion = upsertUsageRecord(
           state,
           `session:${message.messageId}`,
           {
-            date: dateInTimezone(occurredAt, timezone),
+            date: dateInTimezone(message.timestamp, timezone),
             source: "claude",
             model: message.model,
             requests: 1,
@@ -142,19 +193,23 @@ export async function collectClaudeUsage({
             outputTokens: message.outputTokens,
             cacheReadTokens: message.cacheReadTokens,
             cacheCreationTokens: message.cacheCreationTokens,
-            dataThrough: occurredAt,
+            dataThrough: message.timestamp,
+            stopReason: message.stopReason,
           },
           pricingCatalog,
+          { shouldReplace: shouldReplaceClaudeUsage },
         );
         if (insertion.inserted) result.imported += 1;
+        else if (insertion.updated) result.updated += 1;
         else result.skipped += 1;
         if (insertion.unknownModel) result.unknownModels.add(insertion.unknownModel);
       }
       state.fileCursors[file] = {
-        lineOffset: lines.length,
+        lineOffset: processedLineOffset,
         mtimeMs: stat.mtimeMs,
         size: stat.size,
         source: "claude",
+        complete,
       };
       result.changedFiles += 1;
     } catch (error) {
@@ -164,4 +219,4 @@ export async function collectClaudeUsage({
   return result;
 }
 
-export const claudeInternals = { parseLines, shouldReplaceClaudeUsage };
+export const claudeInternals = { parseLines, shouldReplaceClaudeUsage, usageCounter };

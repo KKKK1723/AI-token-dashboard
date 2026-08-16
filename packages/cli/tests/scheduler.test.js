@@ -28,6 +28,7 @@ test("Windows schedules run the CLI through a hidden WScript host", async (t) =>
   assert.equal(command, "powershell.exe");
   assert.match(args.at(-1), /New-ScheduledTaskAction -Execute \$wscript/);
   assert.match(args.at(-1), /\/\/B \/\/NoLogo/);
+  assert.match(args.at(-1), /New-TimeSpan -Minutes 10/);
   assert.doesNotMatch(args.at(-1), /-Execute \$env:ATD_NODE/);
   assert.equal(options.env.ATD_RUNNER, runnerPath);
 });

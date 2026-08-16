@@ -8,15 +8,18 @@ import { fileURLToPath } from "node:url";
 import { createPairingCode, redeemPairingCode, uploadUsage } from "./api.js";
 import { collectUsage } from "./collector.js";
 import { protectSecret, revealSecret } from "./credentials.js";
+import { authorizeGithubDevice } from "./github-oauth.js";
 import { decodePairingBundle, encodePairingBundle, validateDeviceToken } from "./pairing.js";
 import { dashboardPaths, defaultClaudeDirectory, defaultCodexDirectory } from "./paths.js";
 import { importSeed, pruneLocalHistory } from "./records.js";
+import { reconcileUsage } from "./reconciliation.js";
 import { installSchedule, removeSchedule } from "./scheduler.js";
 import { appendLog, createEmptyState, readJson, validateState, withFileLock, writeJsonAtomic } from "./storage.js";
 
-const VERSION = "2.1.2";
+const VERSION = "2.2.0";
 const PACKAGE_NAME = "@kkkk1723/ai-token-dashboard";
 const NPM_REGISTRY = "https://registry.npmjs.org/";
+const DEFAULT_API_URL = "https://ai-token-dashboard.tt122afadfa.workers.dev";
 
 function parseOptions(args, {
   positionals = 0,
@@ -53,16 +56,16 @@ function help() {
 Usage:
   ai-token-dashboard init --api-url <url> --key <sync-key> [--seed <file>]
   ai-token-dashboard pair
-  ai-token-dashboard setup <pairing-string> [--device-name <name>]
+  ai-token-dashboard setup [pairing-string] [--device-name <name>]
   ai-token-dashboard collect
   ai-token-dashboard sync
   ai-token-dashboard status
+  ai-token-dashboard doctor [--repair] [--days <1-30>]
   ai-token-dashboard uninstall
 
 Options:
   --timezone <iana>     Account timezone (default: Asia/Shanghai)
   --device-name <name>  Friendly device label
-  --at <HH:mm>          Daily sync time (default: 03:10)
   --seed <file>         One-time CCSwitch migration seed
   --new-device          Generate a replacement device identity
   --no-schedule         Do not install the operating-system timer
@@ -97,13 +100,21 @@ export function normalizeApiUrl(value) {
   return parsed.toString().replace(/\/$/, "");
 }
 
-function parseSetupOptions(args) {
+function parseSetupOptions(
+  args,
+  { pairingRequired = false, pairingAllowed = true } = {},
+) {
   const options = parseOptions(args, {
     positionals: 1,
     booleanOptions: ["no-schedule", "no-sync"],
-    valueOptions: ["timezone", "device-name", "at"],
+    valueOptions: ["api-url", "timezone", "device-name", "at"],
   });
-  if (options._.length !== 1) throw new Error("A pairing string is required.");
+  if (pairingRequired && options._.length !== 1) {
+    throw new Error("A pairing string is required.");
+  }
+  if (!pairingAllowed && options._.length) {
+    throw new Error("A pairing string is not accepted for GitHub setup.");
+  }
   return options;
 }
 
@@ -135,8 +146,11 @@ function runNpm(args, { capture = false } = {}) {
 
 async function installAndRunSetup(paths, args) {
   const options = parseSetupOptions(args);
-  const pairing = decodePairingBundle(options._[0]);
-  normalizeApiUrl(pairing.apiUrl);
+  const pairing = options._[0] ? decodePairingBundle(options._[0]) : null;
+  if (pairing && options["api-url"]) {
+    throw new Error("--api-url cannot be combined with a pairing string.");
+  }
+  normalizeApiUrl(pairing?.apiUrl || options["api-url"] || DEFAULT_API_URL);
   if (await readJson(paths.config)) {
     throw new Error("Dashboard is already initialized on this device; setup will not overwrite it.");
   }
@@ -159,7 +173,8 @@ async function installAndRunSetup(paths, args) {
     "ai-token-dashboard.js",
   );
   await fs.access(scriptPath);
-  const result = spawnSync(process.execPath, [scriptPath, "__setup", ...args], {
+  const internalCommand = pairing ? "__setup" : "__oauth-setup";
+  const result = spawnSync(process.execPath, [scriptPath, internalCommand, ...args], {
     stdio: "inherit",
     windowsHide: true,
   });
@@ -175,12 +190,13 @@ async function installAutomaticSync(paths, options) {
     dataDirectory: paths.directory,
     at: options.at || "03:10",
   });
-  console.log(`Installed 60-second local collection and daily sync at ${options.at || "03:10"}.`);
+  console.log("Installed 60-second local collection and 10-minute dirty sync.");
 }
 
 function collectionSummary(collection) {
   return {
     imported: collection.results.reduce((sum, result) => sum + result.imported, 0),
+    updated: collection.results.reduce((sum, result) => sum + (result.updated || 0), 0),
     unknownModels: collection.unknownModels,
   };
 }
@@ -201,7 +217,7 @@ async function uploadPending(paths, config, state) {
   await writeJsonAtomic(paths.state, state);
   const message =
     `Synced ${pending.payload.buckets.length} daily model buckets at sequence ${pending.payload.sequence}; ` +
-    `imported ${pending.imported || 0} new request records.`;
+      `imported ${pending.imported || 0} and corrected ${pending.updated || 0} request records.`;
   await appendLog(paths.log, message);
   for (const model of pending.unknownModels || []) {
     await appendLog(paths.log, `Model without a price (cost remains $0): ${model}`);
@@ -217,10 +233,12 @@ async function collectLocal(paths) {
     const summary = collectionSummary(collection);
     if (collection.changed) {
       state.needsSync = true;
+    }
+    if (collection.changed || collection.stateChanged) {
       await writeJsonAtomic(paths.state, state);
     }
     const message =
-      `Collected ${summary.imported} new request records from ` +
+      `Collected ${summary.imported} new and corrected ${summary.updated} request records from ` +
       `${collection.results.reduce((sum, result) => sum + result.changedFiles, 0)} changed files.`;
     if (collection.changed) await appendLog(paths.log, message);
     for (const model of summary.unknownModels) {
@@ -236,26 +254,46 @@ async function sync(paths) {
     let response = null;
     if (state.pendingSync) response = await uploadPending(paths, config, state);
 
+    let reconciliation = null;
+    const lastReconciliation = Date.parse(
+      state.diagnostics.lastReconciliation?.at || "",
+    );
+    if (
+      !Number.isFinite(lastReconciliation) ||
+      Date.now() - lastReconciliation >= 24 * 60 * 60_000
+    ) {
+      reconciliation = await reconcileUsage(config, state, {
+        days: config.reconciliationDays || 7,
+        repair: true,
+      });
+    }
     const collection = await collectUsage(config, state);
     const summary = collectionSummary(collection);
     if (collection.changed) state.needsSync = true;
     if (!state.needsSync && state.syncSequence > 0) {
+      if (collection.stateChanged || reconciliation) {
+        await writeJsonAtomic(paths.state, state);
+      }
       console.log("No new local usage to sync.");
       return response;
     }
     const sequence = state.syncSequence + 1;
     const payload = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      snapshotId: randomUUID(),
       deviceId: config.deviceId,
       deviceName: config.deviceName,
       timezone: config.timezone,
       collectorVersion: VERSION,
       sequence,
+      windowStartDate: collection.range.start,
+      windowEndDate: collection.range.end,
       buckets: collection.buckets,
     };
     state.pendingSync = {
       payload,
       imported: summary.imported,
+      updated: summary.updated,
       unknownModels: summary.unknownModels,
       retainFrom: collection.range.start,
       createdAt: new Date().toISOString(),
@@ -265,6 +303,54 @@ async function sync(paths) {
     state.needsSync = false;
     await writeJsonAtomic(paths.state, state);
     return uploadPending(paths, config, state);
+  }, { waitMs: 60_000 });
+}
+
+async function doctor(paths, options) {
+  return withFileLock(paths.lock, async () => {
+    const { config, state } = await loadConfigured(paths);
+    const days = Number(options.days || config.reconciliationDays || 7);
+    if (!Number.isSafeInteger(days) || days < 1 || days > 30) {
+      throw new Error("--days must be an integer between 1 and 30.");
+    }
+    const sourceDirectories = {};
+    for (const [source, directory] of Object.entries(config.sources)) {
+      const stat = await fs.stat(directory).catch(() => null);
+      sourceDirectories[source] = {
+        path: directory,
+        readable: Boolean(stat?.isDirectory()),
+      };
+    }
+    const reconciliation = await reconcileUsage(config, state, {
+      days,
+      repair: Boolean(options.repair),
+    });
+    await writeJsonAtomic(paths.state, state);
+    const healthy =
+      reconciliation.trustworthy &&
+      state.diagnostics.status === "ok" &&
+      (!reconciliation.mismatch || reconciliation.repaired);
+    console.log(
+      JSON.stringify(
+        {
+          status: healthy ? "ok" : "degraded",
+          deviceId: config.deviceId,
+          deviceName: config.deviceName,
+          sources: sourceDirectories,
+          diagnostics: state.diagnostics,
+          codexQuota: state.quotaSnapshots.codex || null,
+          reconciliation: {
+            range: reconciliation.range,
+            mismatch: reconciliation.mismatch,
+            repaired: reconciliation.repaired,
+            trustworthy: reconciliation.trustworthy,
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    return healthy ? 0 : 2;
   }, { waitMs: 60_000 });
 }
 
@@ -290,6 +376,7 @@ async function initialize(paths, options) {
     deviceName: options["device-name"] || existing?.deviceName || os.hostname(),
     timezone,
     uploadDays: 45,
+    reconciliationDays: existing?.reconciliationDays || 7,
     pricingOverrides: existing?.pricingOverrides || {},
     sources: {
       claude: existing?.sources?.claude || defaultClaudeDirectory(),
@@ -314,7 +401,7 @@ async function initialize(paths, options) {
 
 async function printPairingCommand(paths) {
   const { config } = await loadConfigured(paths);
-  if (config.credentialType === "device") {
+  if (config.credentialType !== "master") {
     throw new Error("Only a device initialized with the master sync key can create pairing codes.");
   }
   const response = await createPairingCode({
@@ -358,6 +445,7 @@ async function initializeFromPairing(paths, options) {
     deviceName,
     timezone,
     uploadDays: 45,
+    reconciliationDays: 7,
     pricingOverrides: {},
     sources: {
       claude: defaultClaudeDirectory(),
@@ -368,6 +456,52 @@ async function initializeFromPairing(paths, options) {
   await writeJsonAtomic(paths.state, createEmptyState());
   await installAutomaticSync(paths, options);
   console.log(`Initialized paired device ${config.deviceName} (${config.deviceId}).`);
+  if (!options["no-sync"]) await sync(paths);
+}
+
+async function initializeFromGithub(paths, options) {
+  if (await readJson(paths.config)) {
+    throw new Error("Dashboard is already initialized on this device; setup will not overwrite it.");
+  }
+  const apiUrl = normalizeApiUrl(options["api-url"] || DEFAULT_API_URL);
+  const deviceId = randomUUID();
+  const deviceName = options["device-name"] || os.hostname();
+  const response = await authorizeGithubDevice({
+    apiUrl,
+    deviceId,
+    deviceName,
+    timezone: options.timezone,
+    version: VERSION,
+  });
+  const timezone = response.timezone;
+  if (typeof timezone !== "string" || !timezone || timezone.length > 80) {
+    throw new Error("Worker returned an invalid account timezone.");
+  }
+  if (options.timezone && options.timezone !== timezone) {
+    throw new Error(`Account timezone must be ${timezone}.`);
+  }
+  const config = {
+    schemaVersion: 1,
+    apiUrl,
+    syncKey: protectSecret(validateDeviceToken(response.deviceToken)),
+    credentialType: "github",
+    deviceId,
+    deviceName,
+    timezone,
+    uploadDays: 45,
+    reconciliationDays: 7,
+    pricingOverrides: {},
+    sources: {
+      claude: defaultClaudeDirectory(),
+      codex: defaultCodexDirectory(),
+    },
+  };
+  await writeJsonAtomic(paths.config, config);
+  await writeJsonAtomic(paths.state, createEmptyState());
+  await installAutomaticSync(paths, options);
+  console.log(
+    `Initialized GitHub-authorized device ${config.deviceName} (${config.deviceId}).`,
+  );
   if (!options["no-sync"]) await sync(paths);
 }
 
@@ -386,6 +520,8 @@ async function status(paths) {
     cutoffAt: state.cutoffAt,
     pendingSequence: state.pendingSync?.payload?.sequence || null,
     needsSync: state.needsSync,
+    diagnostics: state.diagnostics,
+    codexQuota: state.quotaSnapshots.codex || null,
   }, null, 2));
 }
 
@@ -404,7 +540,15 @@ export async function main(args) {
     if (command === "setup") return installAndRunSetup(paths, rest);
     if (command === "init") await initialize(paths, parseOptions(rest));
     else if (command === "__setup") {
-      await initializeFromPairing(paths, parseSetupOptions(rest));
+      await initializeFromPairing(
+        paths,
+        parseSetupOptions(rest, { pairingRequired: true }),
+      );
+    } else if (command === "__oauth-setup") {
+      await initializeFromGithub(
+        paths,
+        parseSetupOptions(rest, { pairingAllowed: false }),
+      );
     } else if (command === "pair") {
       parseOptions(rest, {
         booleanOptions: [],
@@ -414,9 +558,17 @@ export async function main(args) {
     } else if (command === "collect") await collectLocal(paths);
     else if (command === "sync") await sync(paths);
     else if (command === "status") await status(paths);
-    else if (command === "uninstall") {
+    else if (command === "doctor") {
+      return doctor(
+        paths,
+        parseOptions(rest, {
+          booleanOptions: ["repair"],
+          valueOptions: ["days"],
+        }),
+      );
+    } else if (command === "uninstall") {
       await removeSchedule();
-      console.log("Removed the local collection and daily sync schedules. Local usage data was retained.");
+      console.log("Removed the automatic collection and sync schedules. Local usage data was retained.");
     } else {
       throw new Error(`Unknown command: ${command}`);
     }

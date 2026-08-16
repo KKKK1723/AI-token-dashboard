@@ -190,6 +190,25 @@ class SvgRenderingTests(unittest.TestCase):
             self.assertIn(f">{percentage:.1f}%</text>", svg)
         self.assertEqual(sum(percentages), 100.0)
 
+    def test_footer_uses_generation_time_not_latest_usage_event(self) -> None:
+        snapshot = self.make_snapshot()
+        snapshot = UsageSnapshot(
+            window_start=snapshot.window_start,
+            window_end=snapshot.window_end,
+            generated_at=snapshot.generated_at,
+            data_through=snapshot.generated_at - timedelta(days=9),
+            requests=snapshot.requests,
+            input_tokens=snapshot.input_tokens,
+            output_tokens=snapshot.output_tokens,
+            cache_read_tokens=snapshot.cache_read_tokens,
+            cache_creation_tokens=snapshot.cache_creation_tokens,
+            cost_usd=snapshot.cost_usd,
+            models=snapshot.models,
+        )
+        svg = render_svg(snapshot, "light")
+        self.assertIn("Updated Jul 25 / 15:10 CST", svg)
+        self.assertNotIn("Updated Jul 16", svg)
+
     def test_writes_both_themes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             light, dark = write_dashboard_assets(self.make_snapshot(), Path(directory))
