@@ -58,7 +58,7 @@
 
   <rect x="0.5" y="270" width="499" height="29.5" fill="#161b22"/>
   <line x1="0" y1="270" x2="500" y2="270" stroke="#30363d"/>
-  <text class="ui footer" x="18" y="289" fill="#8b949e">Aug 10 - Sep 8</text>
-  <text class="ui footer" x="482" y="289" fill="#8b949e" text-anchor="end">Updated Sep 8 / 06:09 CST</text>
+  <text class="ui footer" x="18" y="289" fill="#8b949e">Aug 11 - Sep 9</text>
+  <text class="ui footer" x="482" y="289" fill="#8b949e" text-anchor="end">Updated Sep 9 / 05:56 CST</text>
   <rect x="0.5" y="0.5" width="499" height="299" rx="6" fill="none" stroke="#30363d"/>
 </svg>
